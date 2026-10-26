@@ -1,0 +1,53 @@
+# One workflow, two builds: Windows .exe + Android .apk.
+# Runs on every push to main/master, and on demand from the Actions tab ("Run workflow").
+# Results: open the finished run -> Artifacts -> HotShare-windows-exe / HotShare-android-apk.
+name: Build HotShare (Windows EXE + Android APK)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller (the app itself has no dependencies)
+        run: pip install pyinstaller
+      - name: Build single-file windowed EXE
+        run: >
+          pyinstaller --onefile --windowed --clean --name HotShare
+          --exclude-module unittest --exclude-module pydoc --exclude-module doctest
+          hotshare_desktop.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HotShare-windows-exe
+          path: windows/dist/HotShare.exe
+
+  android-apk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"        # matches Android Gradle Plugin 8.5
+      - name: Build optimized APK (R8 shrink + resource shrink, debug-signed so it installs directly)
+        run: gradle --no-daemon assembleRelease
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HotShare-android-apk
+          path: android/app/build/outputs/apk/release/*.apk

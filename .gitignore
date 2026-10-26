@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+windows/build/
+windows/dist/
+windows/*.spec
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
