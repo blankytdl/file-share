@@ -128,13 +128,13 @@ object Core {
 
     // ---------- sending (auto-resume) ----------
     fun sendTo(dev: Dev, items: List<Item>, dest: String) {
-        val t = begin("→ ${dev.name}", false); var attempt = 0
+        val t = begin("To ${dev.name}", false); var attempt = 0
         while (true) {
             try { sendOnce(dev, items, dest, t); end(t, true, "Sent ${items.size} item(s)"); return }
             catch (e: IOException) {
                 if (t.cancelled) { end(t, false, "Cancelled"); return }
                 if (e is Declined || ++attempt > 3) { end(t, false, e.message ?: "failed"); return }
-                log("Connection problem – resuming (attempt $attempt)…"); try { Thread.sleep(1000L * attempt) } catch (_: InterruptedException) {}
+                log("Connection problem - resuming (attempt $attempt)..."); try { Thread.sleep(1000L * attempt) } catch (_: InterruptedException) {}
             } catch (e: Exception) { end(t, false, e.message ?: "failed"); return }
         }
     }
@@ -217,7 +217,7 @@ object Core {
                 if (readLine(inp) != hex(md.digest())) { part.delete(); throw IOException("checksum mismatch: $rel") }
                 val segs = rel.replace("\\", "/").split("/").filter { it.isNotEmpty() && it != "." && it != ".." && !it.contains(":") }
                 saveFinal(part, dest + segs.dropLast(1), segs.lastOrNull() ?: "file"); part.delete(); got++
-                history("in", rel, size, peer); log("Received $rel ✓ verified")
+                history("in", rel, size, peer); log("Received $rel (verified)")
             }
             out.write("DONE\n".toByteArray()); out.flush(); tick(t, total); end(t, true, "Received $got file(s)")
         } catch (e: Exception) {
@@ -230,19 +230,24 @@ object Core {
     private fun saveFinal(part: File, dirs: List<String>, name: String) {
         val tree = prefs.getString("tree", null)
         if (tree != null) {
-            var d = DocumentFile.fromTreeUri(app, Uri.parse(tree)) ?: throw IOException("save folder unavailable — choose it again in Settings")
+            var d = DocumentFile.fromTreeUri(app, Uri.parse(tree)) ?: throw IOException("save folder unavailable - choose it again in Settings")
             for (p in dirs) d = d.findFile(p)?.takeIf { it.isDirectory } ?: d.createDirectory(p) ?: throw IOException("cannot create $p")
             var n = name; var i = 1; val b = name.substringBeforeLast('.', name); val e = name.substringAfterLast('.', "")
             while (d.findFile(n) != null) n = if (e.isEmpty()) "$b (${i++})" else "$b (${i++}).$e"
             val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(e.lowercase()) ?: "application/octet-stream"
             val f = d.createFile(mime, n) ?: throw IOException("cannot create $n")
             (app.contentResolver.openOutputStream(f.uri) ?: throw IOException("cannot write")).use { o -> part.inputStream().use { it.copyTo(o, BUF) } }
-        } else {
+        } else if (Build.VERSION.SDK_INT >= 29) {
             val cv = ContentValues().apply { put(MediaStore.Downloads.DISPLAY_NAME, name); put(MediaStore.Downloads.RELATIVE_PATH, "Download/HotShare" + dirs.joinToString("") { "/$it" }); put(MediaStore.Downloads.IS_PENDING, 1) }
             val uri = app.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv) ?: throw IOException("MediaStore refused file")
             try { (app.contentResolver.openOutputStream(uri) ?: throw IOException("cannot write")).use { o -> part.inputStream().use { it.copyTo(o, BUF) } } }
             catch (e: Exception) { app.contentResolver.delete(uri, null, null); throw e }
             cv.clear(); cv.put(MediaStore.Downloads.IS_PENDING, 0); app.contentResolver.update(uri, cv, null, null)
+        } else {   // Android 8-9: no scoped MediaStore -> app folder (no permission needed); pick a custom folder in the app for a nicer location
+            val dir = File(app.getExternalFilesDir(null) ?: app.filesDir, "HotShare" + dirs.joinToString("") { "/$it" }).apply { mkdirs() }
+            var f = File(dir, name); var i = 1; val b = name.substringBeforeLast('.', name); val e = name.substringAfterLast('.', "")
+            while (f.exists()) f = File(dir, if (e.isEmpty()) "$b (${i++})" else "$b (${i++}).$e")
+            part.copyTo(f)
         }
     }
 
@@ -275,6 +280,11 @@ object Core {
         val ss = try { a.listenUsingRfcommWithServiceRecord("HotShare", BT_UUID) } catch (e: SecurityException) { return }; bt = ss
         while (true) { val c = try { ss.accept() } catch (_: IOException) { break }; daemon { c.use { handle(it.inputStream, it.outputStream) } } }
     }
+    fun localIps(): List<String> = try {
+        NetworkInterface.getNetworkInterfaces()?.toList()?.filter { it.isUp && !it.isLoopback }
+            ?.flatMap { ni -> ni.interfaceAddresses.mapNotNull { (it.address as? Inet4Address)?.hostAddress } } ?: emptyList()
+    } catch (e: Exception) { emptyList() }
+
     fun scan(): List<Dev> {
         val s = DatagramSocket().apply { broadcast = true; soTimeout = 1500 }; val q = "HSH?".toByteArray()
         val nis = NetworkInterface.getNetworkInterfaces()?.toList() ?: emptyList(); val targets = HashSet<InetAddress>(); targets.add(InetAddress.getByName("255.255.255.255"))
@@ -291,17 +301,17 @@ object Notifier {
     private fun nm() = Core.app.getSystemService(NotificationManager::class.java)
     private var lastP = 0L
     fun channels() { nm().createNotificationChannel(NotificationChannel("svc", "Background receiving", NotificationManager.IMPORTANCE_LOW)); nm().createNotificationChannel(NotificationChannel("hs", "Transfers", NotificationManager.IMPORTANCE_HIGH)) }
-    fun foreground(): Notification = Notification.Builder(Core.app, "svc").setSmallIcon(android.R.drawable.ic_menu_share).setContentTitle("HotShare is ready to receive").setContentText("Visible to nearby devices")
+    fun foreground(): Notification = Notification.Builder(Core.app, "svc").setSmallIcon(R.drawable.ic_stat).setContentTitle("HotShare is ready to receive").setContentText("Visible to nearby devices")
         .setContentIntent(PendingIntent.getActivity(Core.app, 0, Intent(Core.app, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)).setOngoing(true).build()
     fun approval(a: Core.Approval) {
         fun pi(res: Int) = PendingIntent.getBroadcast(Core.app, a.id * 10 + res, Intent(Core.app, ActionReceiver::class.java).putExtra("id", a.id).putExtra("res", res), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        nm().notify(a.id, Notification.Builder(Core.app, "hs").setSmallIcon(android.R.drawable.stat_sys_download).setContentTitle("Incoming from ${a.peer}").setContentText("${a.count} item(s), ${a.total / 1048576} MB")
+        nm().notify(a.id, Notification.Builder(Core.app, "hs").setSmallIcon(R.drawable.ic_stat).setContentTitle("Incoming from ${a.peer}").setContentText("${a.count} item(s), ${a.total / 1048576} MB")
             .addAction(Notification.Action.Builder(0, "Accept", pi(1)).build()).addAction(Notification.Action.Builder(0, "Always", pi(2)).build()).addAction(Notification.Action.Builder(0, "Decline", pi(3)).build()).setAutoCancel(true).build())
     }
-    fun info(title: String, text: String) { nm().notify((System.nanoTime() % 100000).toInt() + 5000, Notification.Builder(Core.app, "hs").setSmallIcon(android.R.drawable.stat_sys_download_done).setContentTitle(title).setContentText(text).setAutoCancel(true).build()) }
+    fun info(title: String, text: String) { nm().notify((System.nanoTime() % 100000).toInt() + 5000, Notification.Builder(Core.app, "hs").setSmallIcon(R.drawable.ic_stat).setContentTitle(title).setContentText(text).setAutoCancel(true).build()) }
     fun progress(t: Core.Transfer) {
         val now = System.currentTimeMillis(); if (now - lastP < 1000) return; lastP = now
-        nm().notify(2000 + t.id, Notification.Builder(Core.app, "svc").setSmallIcon(android.R.drawable.stat_sys_download).setContentTitle(t.label).setContentText("%.1f MB/s".format(t.speed / 1048576))
+        nm().notify(2000 + t.id, Notification.Builder(Core.app, "svc").setSmallIcon(R.drawable.ic_stat).setContentTitle(t.label).setContentText("%.1f MB/s".format(t.speed / 1048576))
             .setProgress(1000, if (t.total > 0) (t.done * 1000 / t.total).toInt() else 0, false).setOngoing(true).build())
     }
     fun cancel(id: Int) = nm().cancel(id)

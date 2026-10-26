@@ -2,14 +2,24 @@ plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
 android {
     namespace = "com.hotshare"
     compileSdk = 34
-    defaultConfig { applicationId = "com.hotshare"; minSdk = 29; targetSdk = 34; versionCode = 3; versionName = "3.0" }
+    defaultConfig {
+        applicationId = "com.hotshare"; minSdk = 26; targetSdk = 34
+        // always increases with each GitHub run, so a new build can be installed over an older one
+        versionCode = 1000 + (System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0)
+        versionName = "3.1"
+    }
+    signingConfigs {
+        // Fixed key committed with the project: every build is signed identically, so updates install cleanly.
+        create("hotshare") { storeFile = file("../hotshare.keystore"); storePassword = "hotshare"; keyAlias = "hotshare"; keyPassword = "hotshare"; storeType = "pkcs12" }
+    }
     buildTypes {
         release {
             isMinifyEnabled = true          // R8 shrink + optimize
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
-            signingConfig = signingConfigs.getByName("debug")   // sideloadable; swap for your own key for Play Store
+            signingConfig = signingConfigs.getByName("hotshare")
         }
+        debug { signingConfig = signingConfigs.getByName("hotshare") }
     }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }

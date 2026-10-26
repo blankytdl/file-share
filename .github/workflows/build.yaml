@@ -21,9 +21,10 @@ jobs:
           python-version: "3.12"
       - name: Install PyInstaller (the app itself has no dependencies)
         run: pip install pyinstaller
-      - name: Build single-file windowed EXE
+      - name: Build single-file windowed EXE (with app icon)
         run: >
           pyinstaller --onefile --windowed --clean --name HotShare
+          --icon icon.ico --add-data "icon.ico;." --add-data "logo.png;."
           --exclude-module unittest --exclude-module pydoc --exclude-module doctest
           hotshare_desktop.py
       - uses: actions/upload-artifact@v4
@@ -45,7 +46,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.7"        # matches Android Gradle Plugin 8.5
-      - name: Build optimized APK (R8 shrink + resource shrink, debug-signed so it installs directly)
+      - name: Build optimized APK (R8 shrink; signed with the project's fixed key so builds install over each other)
         run: gradle --no-daemon assembleRelease
       - uses: actions/upload-artifact@v4
         with:

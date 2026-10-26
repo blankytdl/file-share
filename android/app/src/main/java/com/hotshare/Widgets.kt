@@ -6,6 +6,7 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.LinearGradient
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Shader
 import android.graphics.drawable.GradientDrawable
 import android.view.MotionEvent
@@ -74,6 +75,30 @@ class BarView(c: Context) : View(c) {
         if (cur > 0f) {
             fill.shader = LinearGradient(0f, 0f, w, 0f, if (done) C.ok else C.accent, if (done) C.ok else C.accent2, Shader.TileMode.CLAMP)
             c.drawRoundRect(0f, 0f, maxOf(h, w * cur), h, r, r, fill)
+        }
+    }
+}
+
+/** Crisp vector icon from the shared icon set (no emoji/fonts, so it never renders as a broken box). */
+class IconView(c: Context, private val name: String, private val color: Int = C.text) : View(c) {
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
+
+    override fun onDraw(c: Canvas) {
+        val k = minOf(width, height) / 24f; val ox = (width - 24f * k) / 2; val oy = (height - 24f * k) / 2
+        p.color = color; p.strokeWidth = 2f * k
+        val prims = Icons.all[name] ?: return
+        for (pr in prims) {
+            val v = pr.v
+            when (pr.k) {
+                0, 1 -> {
+                    val path = Path(); path.moveTo(ox + v[0] * k, oy + v[1] * k)
+                    var i = 2; while (i < v.size) { path.lineTo(ox + v[i] * k, oy + v[i + 1] * k); i += 2 }
+                    if (pr.k == 1) path.close()
+                    p.style = Paint.Style.STROKE; c.drawPath(path, p)
+                }
+                2 -> { p.style = Paint.Style.STROKE; c.drawCircle(ox + v[0] * k, oy + v[1] * k, v[2] * k, p) }
+                else -> { p.style = Paint.Style.FILL; c.drawCircle(ox + v[0] * k, oy + v[1] * k, v[2] * k, p) }
+            }
         }
     }
 }
