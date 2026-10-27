@@ -22,6 +22,20 @@
 Both apps have a **Receive into** card on the main screen: **Change folder** opens the system folder chooser, **Open folder** opens it in your file manager.
 On the PC you can also pick a different folder for one transfer in the Accept dialog, and when sending you can name a subfolder to create on the other device.
 
+## What's in the apps
+- **PC:** sidebar (devices, receive-into folder, themes) + main area with a **drag-and-drop** zone, **Ctrl+V / Paste** (files copied in Explorer, or text),
+  an editable **To send** list (remove one item or clear all), sticky Send bar, and transfer cards with an overall bar **and a progress bar for every file**
+  (for both sending and receiving). Six colour themes (Midnight, Ocean, Emerald, Sunset, Orchid, Daylight), sharp text on high-DPI screens,
+  a title bar coloured to match the theme (Windows 10/11).
+- **Android:** the same send list, Paste button, per-file progress and themes; Send bar stays on screen.
+
+## If "Scan" finds nothing
+1. Both devices on the same hotspot / Wi-Fi (or USB tether).
+2. **Windows Firewall:** the first time HotShare.exe runs, allow it on *Private* networks (UDP 45454 + TCP 45455). If you clicked Cancel, re-allow it in
+   Windows Security > Firewall > Allow an app.
+3. Android now pins itself to the Wi-Fi network (phones otherwise send app traffic over mobile data when the Wi-Fi has no internet) and, if broadcasts
+   are blocked, automatically probes every address on the network. You can also tap **Add IP** and type the PC's address (shown under the HotShare title).
+
 ## Using it
 Put both devices on the same hotspot / Wi-Fi / USB-tether link, open the app on both, tap Refresh/Scan, select the other
 device, then send files, a folder, an app (Android) or text. Optional: set the same PIN on both devices in Settings.

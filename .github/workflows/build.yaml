@@ -24,7 +24,7 @@ jobs:
       - name: Build single-file windowed EXE (with app icon)
         run: >
           pyinstaller --onefile --windowed --clean --name HotShare
-          --icon icon.ico --add-data "icon.ico;." --add-data "logo.png;."
+          --icon icon.ico --add-data "icon.ico;." --add-data "logo.png;." --add-data "logo2.png;." --add-data "logo3.png;."
           --exclude-module unittest --exclude-module pydoc --exclude-module doctest
           hotshare_desktop.py
       - uses: actions/upload-artifact@v4

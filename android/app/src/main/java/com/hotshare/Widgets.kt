@@ -13,10 +13,30 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.animation.DecelerateInterpolator
 
+class Theme(val name: String, val dark: Boolean, val bg: Int, val card: Int, val card2: Int, val sel: Int, val text: Int, val muted: Int, val accent: Int, val accent2: Int, val ok: Int, val err: Int, val track: Int)
+
+fun mix(a: Int, b: Int, f: Float): Int {
+    fun m(sh: Int): Int { val x = (a shr sh) and 0xFF; val y = (b shr sh) and 0xFF; return (x + (y - x) * f).toInt().coerceIn(0, 255) }
+    return (0xFF shl 24) or (m(16) shl 16) or (m(8) shl 8) or m(0)
+}
+
+/** Colours of the active theme; call C.apply(name) before building views. */
 object C {
-    val bg = 0xFF0F1419.toInt(); val card = 0xFF1A2230.toInt(); val card2 = 0xFF243044.toInt(); val sel = 0xFF22345A.toInt()
-    val text = 0xFFE8EDF5.toInt(); val muted = 0xFF8B97A8.toInt(); val accent = 0xFF4C8DFF.toInt(); val accent2 = 0xFF7C5CFF.toInt()
-    val ok = 0xFF38D39F.toInt(); val err = 0xFFFF6B6B.toInt(); val track = 0xFF2A3446.toInt()
+    private fun rgb(h: Int) = (0xFF shl 24) or h
+    private fun mk(name: String, dark: Boolean, bgH: Int, a1H: Int, a2H: Int): Theme {
+        val bg = rgb(bgH); val a1 = rgb(a1H); val a2 = rgb(a2H); val w = rgb(0xFFFFFF); val k = rgb(0x000000)
+        return if (dark) Theme(name, true, bg, mix(bg, w, .075f), mix(bg, w, .15f), mix(mix(bg, w, .075f), a1, .2f), rgb(0xE8EDF5), rgb(0x8D99AB), a1, a2, rgb(0x38D39F), rgb(0xFF6B6B), mix(bg, w, .17f))
+        else Theme(name, false, bg, w, mix(bg, k, .07f), mix(w, a1, .14f), rgb(0x1B2430), rgb(0x66728A), a1, a2, rgb(0x12A37A), rgb(0xD94646), mix(bg, k, .11f))
+    }
+    val themes: List<Theme> = listOf(mk("Midnight", true, 0x0F1419, 0x4C8DFF, 0x7C5CFF), mk("Ocean", true, 0x0A1620, 0x22D3EE, 0x3B82F6), mk("Emerald", true, 0x0C1713, 0x34D399, 0x22C55E),
+        mk("Sunset", true, 0x181110, 0xFB923C, 0xF43F5E), mk("Orchid", true, 0x130F1D, 0xC084FC, 0xEC4899), mk("Daylight", false, 0xEEF2F8, 0x2F6DF0, 0x6A4CE0))
+    var name = "Midnight"; var dark = true
+    var bg = 0; var card = 0; var card2 = 0; var sel = 0; var text = 0; var muted = 0; var accent = 0; var accent2 = 0; var ok = 0; var err = 0; var track = 0
+    init { apply("Midnight") }
+    fun apply(n: String) {
+        val t = themes.firstOrNull { it.name == n } ?: themes[0]
+        name = t.name; dark = t.dark; bg = t.bg; card = t.card; card2 = t.card2; sel = t.sel; text = t.text; muted = t.muted; accent = t.accent; accent2 = t.accent2; ok = t.ok; err = t.err; track = t.track
+    }
 }
 
 fun Context.dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -80,7 +100,8 @@ class BarView(c: Context) : View(c) {
 }
 
 /** Crisp vector icon from the shared icon set (no emoji/fonts, so it never renders as a broken box). */
-class IconView(c: Context, private val name: String, private val color: Int = C.text) : View(c) {
+class IconView(c: Context, private val name: String, private var color: Int = C.text) : View(c) {
+    fun setIconColor(c: Int) { color = c; invalidate() }
     private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
 
     override fun onDraw(c: Canvas) {

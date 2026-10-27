@@ -76,6 +76,10 @@ class Ctl:
         s.ask = ask or (lambda h, n, t: ("once", None)); s.progress = progress or (lambda *a: None)
         s.text = text or (lambda p, t: None); s.hist = hist or (lambda *a: None)
         s.declined = False; s.cancel = threading.Event(); s._t0 = s._last = s._base = 0
+        s.names, s.sizes, s.fdone, s.last, s.on_files = [], [], [], (0, 0, 0, 0), (lambda: None)
+
+    def set_files(s, names, sizes):
+        s.names, s.sizes, s.fdone = list(names), list(sizes), [0] * len(names); s.on_files()
 
     def start(s, base=0): s._t0, s._last, s._base = time.monotonic(), 0, base
 
@@ -84,7 +88,7 @@ class Ctl:
         now = time.monotonic()
         if now - s._last < .12 and done != total: return
         s._last = now; sp = (done - s._base) / max(now - s._t0, 1e-6)
-        s.progress(done, total, sp, (total - done) / sp if sp > 0 else 0)
+        s.last = (done, total, sp, (total - done) / sp if sp > 0 else 0); s.progress(*s.last)
 
 
 def readline(r, limit=65536):
@@ -98,7 +102,11 @@ def readline(r, limit=65536):
 def handle(sock, ctl):
     cfg = ctl.cfg; sock.settimeout(120); sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     r = sock.makefile("rb", BUF)
-    if readline(r) != b"HSH3": return
+    first = readline(r)
+    if first == b"HSH?":   # discovery over the transfer port (works where UDP broadcast is blocked)
+        if cfg.get("visible", True): sock.sendall(json.dumps({"name": cfg["name"], "port": cfg["port"], "os": platform.system()}).encode() + b"\n")
+        return
+    if first != b"HSH3": return
     h = json.loads(readline(r, MAXH)); peer = str(h.get("name", "?")); files = h["files"]; ctl.label = peer
     if len(files) > 200000: raise ValueError("too many files")
     for f in files:
@@ -123,10 +131,13 @@ def handle(sock, ctl):
         sock.sendall(b"ERR not enough free space\n"); raise IOError("not enough free space")
     sock.sendall(b"OK\n" + json.dumps({"off": offs}).encode() + b"\n")
     done = sum(offs.values()); ctl.start(done); mv = memoryview(bytearray(BUF))
+    ctl.set_files([f["path"] if f["t"] == "file" else "Text message" for f in files], [f.get("size", 0) for f in files])
+    for ix, f in enumerate(files):
+        if f["t"] == "file": ctl.fdone[ix] = offs[f["id"]]
     try:
-        for f in files:
+        for idx, f in enumerate(files):
             if f.get("t") == "text":
-                txt = str(f.get("text", ""))[:1_000_000]; ctl.text(peer, txt); ctl.hist("in", "text", len(txt.encode()), peer); continue
+                txt = str(f.get("text", ""))[:1_000_000]; ctl.text(peer, txt); ctl.hist("in", "text", len(txt.encode()), peer); ctl.fdone[idx] = ctl.sizes[idx]; continue
             rel, size, off, part, md = f["path"], f["size"], offs[f["id"]], parts[f["id"]], hashlib.sha256()
             if off:
                 ctl.log(f"Resuming {rel} from {hsize(off)}")
@@ -137,11 +148,11 @@ def handle(sock, ctl):
                 while left:
                     n = r.readinto(mv[:min(BUF, left)])
                     if not n: raise ConnectionError("connection lost")
-                    o.write(mv[:n]); md.update(mv[:n]); left -= n; done += n; ctl.tick(done, total)
+                    o.write(mv[:n]); md.update(mv[:n]); left -= n; done += n; ctl.fdone[idx] = size - left; ctl.tick(done, total)
             if readline(r).decode() != md.hexdigest():
                 os.remove(part); raise IOError(f"checksum mismatch: {rel}")
             final = unique(safe_path(dest, rel)); os.makedirs(os.path.dirname(final), exist_ok=True); shutil.move(part, final)
-            ctl.got += 1; ctl.log(f"Received {rel} ({hsize(size)}) \u2713"); ctl.hist("in", rel, size, peer)
+            ctl.fdone[idx] = size; ctl.got += 1; ctl.log(f"Received {rel} ({hsize(size)})"); ctl.hist("in", rel, size, peer)
         sock.sendall(b"DONE\n"); ctl.progress(total, total, 0, 0)
     except Exception as e:
         try: sock.sendall(f"ERR {e}\n".encode())
@@ -189,8 +200,9 @@ def send_once(host, port, items, ctl, dest=""):
         if resp.startswith(b"ERR"): raise PermissionError(resp[4:].decode("utf-8", "replace"))
         if resp != b"OK": raise PermissionError("Receiver declined (or PIN mismatch)")
         offs = json.loads(readline(r, MAXH))["off"]; done = sum(offs.values()); ctl.start(done); mv = memoryview(bytearray(BUF))
-        for it in items:
-            if it["t"] == "text": continue
+        ctl.set_files(["Text message" if it["t"] == "text" else it["rel"] for it in items], [it["size"] for it in items])
+        for ix, it in enumerate(items):
+            if it["t"] == "text": ctl.fdone[ix] = it["size"]; continue
             off, md = min(max(int(offs.get(it["id"], 0)), 0), it["size"]), hashlib.sha256()
             with open(it["abs"], "rb", buffering=0) as f:
                 left = off
@@ -202,8 +214,8 @@ def send_once(host, port, items, ctl, dest=""):
                 while left:
                     n = f.readinto(mv[:min(BUF, left)])
                     if not n: raise IOError("file shrank while sending")
-                    s.sendall(mv[:n]); md.update(mv[:n]); left -= n; done += n; ctl.tick(done, total)
-            s.sendall(md.hexdigest().encode() + b"\n")
+                    s.sendall(mv[:n]); md.update(mv[:n]); left -= n; done += n; ctl.fdone[ix] = it["size"] - left; ctl.tick(done, total)
+            s.sendall(md.hexdigest().encode() + b"\n"); ctl.fdone[ix] = it["size"]
         res = readline(r).decode()
         if res != "DONE": raise IOError(res or "no reply")
         ctl.progress(total, total, 0, 0); ctl.log(f"Sent {len(items)} item(s), {hsize(total)} to {ctl.label or host}")
@@ -252,7 +264,25 @@ def discovery_server(cfg):
         except OSError: time.sleep(.05)
 
 
-def scan(timeout=1.5):
+def probe(ip, port, timeout=.6):
+    """Ask a host on the transfer port who it is; None if nobody answers."""
+    try:
+        c = socket.create_connection((ip, port), timeout); c.settimeout(timeout); c.sendall(b"HSH?\n")
+        j = json.loads(c.makefile("rb").readline(2048)); c.close(); return (j["name"], int(j["port"]), j.get("os", ""))
+    except Exception: return None
+
+
+def sweep(port, workers=64):
+    from concurrent.futures import ThreadPoolExecutor
+    mine = set(local_ips()); hosts = [f"{i.rsplit('.', 1)[0]}.{n}" for i in mine for n in range(1, 255)]
+    hosts = [h for h in dict.fromkeys(hosts) if h not in mine]; found = {}
+    with ThreadPoolExecutor(workers) as ex:
+        for h, r in zip(hosts, ex.map(lambda h: probe(h, port), hosts)):
+            if r: found[h] = r
+    return found
+
+
+def scan(timeout=1.5, port=45455):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1); _udp_noreset(s)
     for t in {"255.255.255.255"} | {i.rsplit(".", 1)[0] + ".255" for i in local_ips()}:
         try: s.sendto(b"HSH?", (t, DISC))
@@ -266,4 +296,5 @@ def scan(timeout=1.5):
         if a[0] not in mine:
             try: j = json.loads(d); found[a[0]] = (j["name"], int(j["port"]), j.get("os", ""))
             except (ValueError, KeyError): pass
-    s.close(); return found
+    s.close()
+    return found or sweep(port)

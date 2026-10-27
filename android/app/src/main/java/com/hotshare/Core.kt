@@ -10,6 +10,10 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -40,6 +44,7 @@ object Core {
 
     class Item(val rel: String, val size: Long, val mtime: Long, val text: String? = null, val open: () -> InputStream)
     class Transfer(val id: Int, val label: String, val incoming: Boolean) {
+        @Volatile var names: Array<String> = emptyArray(); @Volatile var sizes = LongArray(0); @Volatile var fdone = LongArray(0)
         @Volatile var done = 0L; @Volatile var total = 0L; @Volatile var cancelled = false; @Volatile var speed = 0.0
         var base = 0L; var t0 = 0L; var last = 0L
         val eta: Int get() = if (speed > 0) ((total - done) / speed).toInt() else 0
@@ -47,7 +52,7 @@ object Core {
     class Approval(val id: Int, val peer: String, val count: Int, val total: Long) { val latch = CountDownLatch(1); @Volatile var result = 3 }
     class Declined(m: String) : IOException(m)
     interface Ui {
-        fun log(m: String); fun started(t: Transfer); fun progress(t: Transfer); fun finished(t: Transfer, ok: Boolean, msg: String)
+        fun log(m: String); fun files(t: Transfer); fun started(t: Transfer); fun progress(t: Transfer); fun finished(t: Transfer, ok: Boolean, msg: String)
         fun approve(a: Approval); fun dismiss(id: Int); fun text(peer: String, t: String)
     }
 
@@ -89,6 +94,7 @@ object Core {
         active.remove(t.id); if (active.isEmpty() && wake?.isHeld == true) wake?.release()
         ui?.finished(t, ok, msg); Notifier.cancel(2000 + t.id); if (ui == null) Notifier.info(if (ok) "Done" else "Transfer stopped", "${t.label}: $msg")
     }
+    private fun setFiles(t: Transfer, names: Array<String>, sizes: LongArray) { t.names = names; t.sizes = sizes; t.fdone = LongArray(names.size); ui?.files(t) }
     fun cancel(id: Int? = null) { active.values.filter { id == null || it.id == id }.forEach { it.cancelled = true } }
     private fun tick(t: Transfer, done: Long) {
         if (t.cancelled) throw InterruptedIOException("cancelled")
@@ -144,32 +150,35 @@ object Core {
             val ad = BluetoothAdapter.getDefaultAdapter(); val s = ad.getRemoteDevice(dev.addr.substring(3)).createRfcommSocketToServiceRecord(BT_UUID); ad.cancelDiscovery(); s.connect()
             sock = s; rin = s.inputStream; rout = s.outputStream
         } else {
-            val s = Socket(); s.connect(InetSocketAddress(dev.addr, dev.port), 8000); s.soTimeout = 180000   // longer than the receiver's 90 s approval wait
+            bindLanNow(); val s = Socket(); s.connect(InetSocketAddress(dev.addr, dev.port), 8000); s.soTimeout = 180000   // longer than the receiver's 90 s approval wait
             sock = s; rin = s.inputStream; rout = s.outputStream
         }
         sock.use {
             val inp = BufferedInputStream(rin, BUF); val out = BufferedOutputStream(rout, BUF)
-            val man = JSONArray(); val ids = HashMap<Item, String>(); var total = 0L
-            items.forEachIndexed { n, it ->
-                if (it.text != null) man.put(JSONObject().put("id", "t$n").put("t", "text").put("path", "text").put("size", it.size).put("text", it.text))
-                else { val id = fid(it.rel, it.size, it.mtime); if (ids.containsValue(id)) return@forEachIndexed; ids[it] = id; total += it.size; man.put(JSONObject().put("id", id).put("t", "file").put("path", it.rel).put("size", it.size)) }
+            val man = JSONArray(); val ids = HashMap<Item, String>(); val sent = ArrayList<Item>(); var total = 0L
+            for (item in items) {
+                if (item.text != null) { man.put(JSONObject().put("id", "t${sent.size}").put("t", "text").put("path", "text").put("size", item.size).put("text", item.text)); sent.add(item) }
+                else { val id = fid(item.rel, item.size, item.mtime); if (ids.containsValue(id)) continue; ids[item] = id; sent.add(item); total += item.size; man.put(JSONObject().put("id", id).put("t", "file").put("path", item.rel).put("size", item.size)) }
             }
             out.write("HSH3\n${JSONObject().put("name", cfg("name", Build.MODEL)).put("pin", cfg("pin")).put("dest", dest).put("files", man)}\n".toByteArray()); out.flush()
             val resp = readLine(inp); if (resp.startsWith("ERR")) throw Declined(resp.drop(4)); if (resp != "OK") throw Declined("${dev.name} declined (or PIN mismatch)")
             val offs = JSONObject(readLine(inp, MAXH)).getJSONObject("off")
             var done = 0L; for (id in ids.values) done += offs.optLong(id, 0)
             t.total = total; t.base = done; t.t0 = System.currentTimeMillis(); val buf = ByteArray(BUF); val md = MessageDigest.getInstance("SHA-256")
-            for (item in items) {
-                val id = ids[item] ?: continue; val off = offs.optLong(id, 0).coerceIn(0, item.size); md.reset()
+            setFiles(t, sent.map { if (it.text != null) "Text message" else it.rel }.toTypedArray(), sent.map { it.size }.toLongArray())
+            sent.forEachIndexed { ix, x -> val xid = ids[x]; t.fdone[ix] = if (xid == null) x.size else offs.optLong(xid, 0).coerceIn(0, x.size) }
+            for ((ix, item) in sent.withIndex()) {
+                if (item.text != null) continue
+                val id = ids[item]!!; val off = offs.optLong(id, 0).coerceIn(0, item.size); md.reset()
                 item.open().use { s ->
                     var left = off; while (left > 0) { val n = s.read(buf, 0, minOf(buf.size.toLong(), left).toInt()); if (n < 0) throw IOException("file changed"); md.update(buf, 0, n); left -= n }
                     left = item.size - off
-                    while (left > 0) { val n = s.read(buf, 0, minOf(buf.size.toLong(), left).toInt()); if (n < 0) throw IOException("file shrank"); out.write(buf, 0, n); md.update(buf, 0, n); left -= n; done += n; tick(t, done) }
+                    while (left > 0) { val n = s.read(buf, 0, minOf(buf.size.toLong(), left).toInt()); if (n < 0) throw IOException("file shrank"); out.write(buf, 0, n); md.update(buf, 0, n); left -= n; done += n; t.fdone[ix] = item.size - left; tick(t, done) }
                 }
-                out.write((hex(md.digest()) + "\n").toByteArray())
+                out.write((hex(md.digest()) + "\n").toByteArray()); t.fdone[ix] = item.size
             }
             out.flush(); val r = readLine(inp); if (r != "DONE") throw IOException(r.ifEmpty { "no reply" })
-            tick(t, total); items.forEach { history("out", it.rel, it.size, dev.name) }
+            tick(t, total); sent.forEach { history("out", it.rel, it.size, dev.name) }
         }
     }
 
@@ -186,7 +195,12 @@ object Core {
 
     private fun handle(rin: InputStream, rout: OutputStream) {
         val inp = BufferedInputStream(rin, BUF); val out = BufferedOutputStream(rout, BUF)
-        if (readLine(inp) != "HSH3") return
+        val first = readLine(inp)
+        if (first == "HSH?") {   // discovery over the transfer port (works where UDP broadcast is blocked)
+            if (prefs.getBoolean("visible", true)) { out.write("${JSONObject().put("name", cfg("name", Build.MODEL)).put("port", cfg("port", "45455").toInt()).put("os", "Android")}\n".toByteArray()); out.flush() }
+            return
+        }
+        if (first != "HSH3") return
         val h = JSONObject(readLine(inp, MAXH)); val peer = h.optString("name", "?"); val pin = cfg("pin"); val files = h.getJSONArray("files")
         if (files.length() > 200000) throw IOException("too many files")
         var total = 0L
@@ -205,18 +219,20 @@ object Core {
             }
             if (pdir.usableSpace < total - done) { out.write("ERR not enough free space\n".toByteArray()); out.flush(); throw Declined("not enough free space") }
             out.write("OK\n${JSONObject().put("off", offs)}\n".toByteArray()); out.flush()
+            setFiles(t, Array(files.length()) { val fo = files.getJSONObject(it); if (fo.getString("t") == "file") fo.getString("path") else "Text message" }, LongArray(files.length()) { files.getJSONObject(it).optLong("size", 0) })
+            for (i in 0 until files.length()) { val fo = files.getJSONObject(i); if (fo.getString("t") == "file") t.fdone[i] = offs.getLong(fo.getString("id")) }
             t.base = done; t.t0 = System.currentTimeMillis(); val buf = ByteArray(BUF); val md = MessageDigest.getInstance("SHA-256")
             val dest = h.optString("dest").replace("\\", "/").split("/").filter { it.isNotEmpty() && it != "." && it != ".." && !it.contains(":") }
             for (i in 0 until files.length()) {
                 val f = files.getJSONObject(i)
-                if (f.getString("t") == "text") { val s = f.optString("text").take(1_000_000); val u = ui; if (u != null) u.text(peer, s) else Notifier.info("Text from $peer", s.take(300)); history("in", "text", s.toByteArray().size.toLong(), peer); continue }
+                if (f.getString("t") == "text") { val s = f.optString("text").take(1_000_000); val u = ui; if (u != null) u.text(peer, s) else Notifier.info("Text from $peer", s.take(300)); history("in", "text", s.toByteArray().size.toLong(), peer); t.fdone[i] = t.sizes[i]; continue }
                 val rel = f.getString("path"); val size = f.getLong("size"); val part = parts[f.getString("id")]!!; val off = offs.getLong(f.getString("id")); md.reset()
                 if (off > 0) { log("Resuming $rel from ${off / 1048576} MB"); FileInputStream(part).use { s -> while (true) { val n = s.read(buf); if (n < 0) break; md.update(buf, 0, n) } } }
                 var left = size - off
-                FileOutputStream(part, true).use { o -> while (left > 0) { val n = inp.read(buf, 0, minOf(buf.size.toLong(), left).toInt()); if (n < 0) throw IOException("connection lost"); o.write(buf, 0, n); md.update(buf, 0, n); left -= n; done += n; tick(t, done) } }
+                FileOutputStream(part, true).use { o -> while (left > 0) { val n = inp.read(buf, 0, minOf(buf.size.toLong(), left).toInt()); if (n < 0) throw IOException("connection lost"); o.write(buf, 0, n); md.update(buf, 0, n); left -= n; done += n; t.fdone[i] = size - left; tick(t, done) } }
                 if (readLine(inp) != hex(md.digest())) { part.delete(); throw IOException("checksum mismatch: $rel") }
                 val segs = rel.replace("\\", "/").split("/").filter { it.isNotEmpty() && it != "." && it != ".." && !it.contains(":") }
-                saveFinal(part, dest + segs.dropLast(1), segs.lastOrNull() ?: "file"); part.delete(); got++
+                saveFinal(part, dest + segs.dropLast(1), segs.lastOrNull() ?: "file"); part.delete(); got++; t.fdone[i] = size
                 history("in", rel, size, peer); log("Received $rel (verified)")
             }
             out.write("DONE\n".toByteArray()); out.flush(); tick(t, total); end(t, true, "Received $got file(s)")
@@ -253,7 +269,7 @@ object Core {
 
     // ---------- servers ----------
     @Synchronized fun startServers() {
-        if (started) return; started = true
+        if (started) return; started = true; bindLan()
         mcast = (app.getSystemService(Context.WIFI_SERVICE) as WifiManager).createMulticastLock("hs").apply { setReferenceCounted(false); acquire() }
         daemon { tcpLoop() }; daemon { udpLoop() }; daemon { btLoop() }
     }
@@ -285,7 +301,50 @@ object Core {
             ?.flatMap { ni -> ni.interfaceAddresses.mapNotNull { (it.address as? Inet4Address)?.hostAddress } } ?: emptyList()
     } catch (e: Exception) { emptyList() }
 
+    private var netCb: ConnectivityManager.NetworkCallback? = null
+
+    /** Android routes app traffic over mobile data when the Wi-Fi has no internet, so LAN scans/sends silently fail.
+     *  Pinning the process to the Wi-Fi/Ethernet network fixes that. */
+    @Suppress("DEPRECATION")
+    fun bindLanNow() {
+        try {
+            val cm = app.getSystemService(ConnectivityManager::class.java)
+            val n = cm.allNetworks.firstOrNull { val c = cm.getNetworkCapabilities(it); c != null && (c.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || c.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) }
+            if (n != null) cm.bindProcessToNetwork(n)
+        } catch (_: Exception) {}
+    }
+    fun bindLan() {
+        try {
+            val cm = app.getSystemService(ConnectivityManager::class.java); bindLanNow(); netCb?.let { cm.unregisterNetworkCallback(it) }
+            val req = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET).build()
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) { try { cm.bindProcessToNetwork(network) } catch (_: Exception) {} }
+                override fun onLost(network: Network) { try { cm.bindProcessToNetwork(null) } catch (_: Exception) {}; bindLanNow() }
+            }
+            cm.registerNetworkCallback(req, cb); netCb = cb
+        } catch (_: Exception) {}
+    }
+    private fun lanIps(): List<String> = try {
+        NetworkInterface.getNetworkInterfaces()?.toList()?.filter { it.isUp && !it.isLoopback && !Regex("rmnet|ccmni|pdp|dummy|tun|ppp|v4-").containsMatchIn(it.name) }
+            ?.flatMap { ni -> ni.interfaceAddresses.mapNotNull { (it.address as? Inet4Address)?.hostAddress } } ?: emptyList()
+    } catch (e: Exception) { emptyList() }
+    private fun probe(ip: String, port: Int): Dev? = try {
+        Socket().use { s ->
+            s.connect(InetSocketAddress(ip, port), 450); s.soTimeout = 700; s.getOutputStream().apply { write("HSH?\n".toByteArray()); flush() }
+            val j = JSONObject(readLine(BufferedInputStream(s.getInputStream()))); Dev(j.getString("name"), ip, j.getInt("port"), j.optString("os"))
+        }
+    } catch (e: Exception) { null }
+    /** Fallback when broadcasts are blocked: ask every host of the local /24 on the transfer port. */
+    private fun sweep(port: Int): List<Dev> {
+        val mine = lanIps().toSet(); val hosts = LinkedHashSet<String>()
+        for (ip in mine) { val pre = ip.substringBeforeLast('.'); for (n in 1..254) if ("$pre.$n" !in mine) hosts.add("$pre.$n") }
+        val found = ConcurrentHashMap<String, Dev>(); val pool = java.util.concurrent.Executors.newFixedThreadPool(64)
+        hosts.forEach { h -> pool.execute { probe(h, port)?.let { found[h] = it } } }
+        pool.shutdown(); pool.awaitTermination(12, TimeUnit.SECONDS); return found.values.toList()
+    }
+
     fun scan(): List<Dev> {
+        bindLanNow()
         val s = DatagramSocket().apply { broadcast = true; soTimeout = 1500 }; val q = "HSH?".toByteArray()
         val nis = NetworkInterface.getNetworkInterfaces()?.toList() ?: emptyList(); val targets = HashSet<InetAddress>(); targets.add(InetAddress.getByName("255.255.255.255"))
         for (ni in nis) for (ia in ni.interfaceAddresses) ia.broadcast?.let { targets.add(it) }
@@ -293,7 +352,8 @@ object Core {
         val mine = nis.flatMap { it.inetAddresses.toList() }.map { it.hostAddress }; val res = LinkedHashMap<String, Dev>(); val b = ByteArray(512)
         try { while (true) { val p = DatagramPacket(b, b.size); s.receive(p); val ip = p.address.hostAddress ?: continue; if (ip in mine) continue
             try { val j = JSONObject(String(p.data, 0, p.length)); res[ip] = Dev(j.getString("name"), ip, j.getInt("port"), j.optString("os")) } catch (_: Exception) {} } } catch (_: SocketTimeoutException) {}
-        s.close(); return res.values.toList()
+        s.close(); val found = res.values.toList()
+        return if (found.isNotEmpty()) found else sweep(cfg("port", "45455").toInt())
     }
 }
 

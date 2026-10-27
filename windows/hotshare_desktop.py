@@ -1,23 +1,42 @@
 #!/usr/bin/env python3
-"""HotShare Desktop GUI (tkinter, custom-drawn icons/cards/animations). Core logic lives in hotshare_core.py."""
+"""HotShare Desktop GUI (tkinter; custom-drawn icons, rounded cards, animations, themes). Logic lives in hotshare_core.py."""
 import os, queue, socket, sys, threading, time, tkinter as tk
 from tkinter import filedialog
 from tkinter import font as tkfont
 import hotshare_core as H
+import hotshare_win as WIN
 from hotshare_icons import draw_tk
-
-DARK = dict(bg="#0f1419", card="#1a2230", card2="#243044", hover="#223049", track="#2a3446", text="#e8edf5", muted="#8b97a8", accent="#4c8dff", ok="#38d39f", err="#ff6b6b")
-LIGHT = dict(bg="#f3f6fb", card="#ffffff", card2="#e3e9f3", hover="#eaf0fb", track="#dfe5ef", text="#1b2430", muted="#6b7686", accent="#2f6df0", ok="#1fae7f", err="#e04b4b")
-FONT = "Segoe UI"
-
-
-def res(name):
-    return os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), name)
 
 
 def lerp(a, b, t):
     x = [int(a[i:i + 2], 16) for i in (1, 3, 5)]; y = [int(b[i:i + 2], 16) for i in (1, 3, 5)]
     return "#%02x%02x%02x" % tuple(int(x[i] + (y[i] - x[i]) * t) for i in range(3))
+
+
+def _mk(bg, a1, a2, dark=True):
+    if dark:
+        t = dict(dark=True, bg=bg, side=lerp(bg, "#ffffff", .03), card=lerp(bg, "#ffffff", .075), card2=lerp(bg, "#ffffff", .15), track=lerp(bg, "#ffffff", .17), text="#e8edf5", muted="#8d99ab", ok="#38d39f", err="#ff6b6b")
+    else:
+        t = dict(dark=False, bg=bg, side=lerp(bg, "#000000", .035), card="#ffffff", card2=lerp(bg, "#000000", .07), track=lerp(bg, "#000000", .11), text="#1b2430", muted="#66728a", ok="#12a37a", err="#d94646")
+    t.update(accent=a1, accent2=a2, hover=lerp(t["card"], a1, .12), line=lerp(bg, t["text"], .12)); return t
+
+
+THEME_ORDER = ["Midnight", "Ocean", "Emerald", "Sunset", "Orchid", "Daylight"]
+THEMES = {"Midnight": _mk("#0f1419", "#4c8dff", "#7c5cff"), "Ocean": _mk("#0a1620", "#22d3ee", "#3b82f6"), "Emerald": _mk("#0c1713", "#34d399", "#22c55e"),
+          "Sunset": _mk("#181110", "#fb923c", "#f43f5e"), "Orchid": _mk("#130f1d", "#c084fc", "#ec4899"), "Daylight": _mk("#eef2f8", "#2f6df0", "#6a4ce0", False)}
+P, SC, FONT = {}, [1.0], ["Segoe UI"]
+
+
+def apply_theme(name): P.clear(); P.update(THEMES.get(name, THEMES["Midnight"]))
+def px(n): return max(1, int(round(n * SC[0])))
+def F(size, bold=False): return (FONT[0], size, "bold" if bold else "normal")
+def short(p, n=44): return p if len(p) <= n else p[:n // 3] + "..." + p[-(n - n // 3 - 3):]
+def res(name): return os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), name)
+
+
+def pick_font(root):
+    have = set(tkfont.families(root))
+    return next((f for f in ("Segoe UI Variable Text", "Segoe UI", "SF Pro Text", "Helvetica Neue", "Inter", "Ubuntu", "Noto Sans", "DejaVu Sans") if f in have), "TkDefaultFont")
 
 
 def rrect(c, x1, y1, x2, y2, r, **kw):
@@ -26,34 +45,30 @@ def rrect(c, x1, y1, x2, y2, r, **kw):
     return c.create_polygon(pts, smooth=True, **kw)
 
 
-def short(p, n=44):
-    return p if len(p) <= n else p[:14] + "..." + p[-(n - 17):]
+def _all(w):
+    for c in w.winfo_children():
+        yield c; yield from _all(c)
 
 
+# ============================ widgets ============================
 class Icon(tk.Canvas):
-    def __init__(s, parent, name, size=22, color="#ffffff", bg=None):
-        super().__init__(parent, width=size, height=size, bg=bg or parent["bg"], highlightthickness=0)
-        s.size, s.name = size, name; s.show(name, color)
+    def __init__(s, parent, name, size=20, color=None, bg=None):
+        s.size = px(size); super().__init__(parent, width=s.size, height=s.size, bg=bg or parent["bg"], highlightthickness=0); s.show(name, color or P["text"])
 
-    def show(s, name, color):
-        s.delete("all"); s.name = name; draw_tk(s, name, 1, 1, s.size - 2, color)
+    def show(s, name, color): s.delete("all"); s.name = name; draw_tk(s, name, 0, 0, s.size, color, width=2)
 
 
 class RBtn(tk.Canvas):
-    def __init__(s, parent, text, cmd, P, w=None, h=36, primary=False, icon=None):
-        tw = tkfont.Font(family=FONT, size=10, weight="bold").measure(text) if text else 0
-        w = w or ((30 if icon else 14) + tw + 16 if text else h)
+    def __init__(s, parent, text, cmd, w=None, h=36, primary=False, icon=None):
+        fnt = tkfont.Font(family=FONT[0], size=10, weight="bold"); tw = fnt.measure(text) if text else 0
+        h, ic, gap = px(h), px(18), (px(8) if icon and text else 0); content = (ic if icon else 0) + gap + tw
+        w = px(w) if w else (content + px(30) if text else h)
         super().__init__(parent, width=w, height=h, bg=parent["bg"], highlightthickness=0, cursor="hand2")
         s.base = P["accent"] if primary else P["card2"]; s.col = s.base; s.fg = "#ffffff" if primary else P["text"]
-        s.shape = rrect(s, 1, 1, w - 1, h - 1, h / 2.4, fill=s.col, outline="")
-        x = 14
-        if icon:
-            if text: draw_tk(s, icon, x, (h - 18) / 2, 18, s.fg)
-            else: draw_tk(s, icon, (w - 18) / 2, (h - 18) / 2, 18, s.fg)
-            x += 26
-        if text: s.create_text(x, h / 2, text=text, fill=s.fg, anchor="w", font=(FONT, 10, "bold"))
-        s.bind("<Enter>", lambda e: s.fade(lerp(s.base, "#ffffff", .14)))
-        s.bind("<Leave>", lambda e: s.fade(s.base))
+        s.shape = rrect(s, 1, 1, w - 1, h - 1, h / 2.4, fill=s.col, outline=""); x = (w - content) / 2   # icon+label centred as one group
+        if icon: draw_tk(s, icon, x, (h - ic) / 2, ic, s.fg)
+        if text: s.create_text(x + (ic + gap if icon else 0), h / 2, text=text, fill=s.fg, anchor="w", font=F(10, True))
+        s.bind("<Enter>", lambda e: s.fade(lerp(s.base, "#ffffff", .15))); s.bind("<Leave>", lambda e: s.fade(s.base))
         s.bind("<ButtonPress-1>", lambda e: s.fade(lerp(s.base, "#000000", .25), 3))
         s.bind("<ButtonRelease-1>", lambda e: (s.fade(s.base, 4), cmd() if 0 <= e.x <= w and 0 <= e.y <= h else None))
 
@@ -67,10 +82,9 @@ class RBtn(tk.Canvas):
 
 
 class Bar(tk.Canvas):
-    def __init__(s, parent, P, h=10):
-        super().__init__(parent, height=h, bg=parent["bg"], highlightthickness=0)
-        s.P, s.h, s.cur, s.tgt, s.run, s.done = P, h, 0.0, 0.0, False, False
-        s.bind("<Configure>", lambda e: s.draw())
+    def __init__(s, parent, h=10, shine=False):
+        super().__init__(parent, height=px(h), bg=parent["bg"], highlightthickness=0)
+        s.h, s.cur, s.tgt, s.run, s.done, s.shine, s.ph = px(h), 0.0, 0.0, False, False, shine, 0.0; s.bind("<Configure>", lambda e: s.draw())
 
     def set(s, v, done=False):
         s.tgt, s.done = max(0.0, min(1.0, v)), done
@@ -78,20 +92,25 @@ class Bar(tk.Canvas):
 
     def step(s):
         if not s.winfo_exists(): return
-        s.cur += (s.tgt - s.cur) * .25
-        if abs(s.tgt - s.cur) < .002: s.cur, s.run = s.tgt, False
+        s.cur += (s.tgt - s.cur) * .25; s.ph = (s.ph + .035) % 1
+        if abs(s.tgt - s.cur) < .002: s.cur = s.tgt
         s.draw()
-        if s.run: s.after(16, s.step)
+        if abs(s.tgt - s.cur) > 0 or (s.shine and not s.done and 0 < s.cur < 1): s.after(33, s.step)
+        else: s.run = False
 
     def draw(s):
         s.delete("all"); w = max(s.winfo_width(), 2); r = s.h / 2
-        rrect(s, 0, 0, w, s.h, r, fill=s.P["track"], outline="")
-        if s.cur > 0: rrect(s, 0, 0, max(s.h, w * s.cur), s.h, r, fill=s.P["ok"] if s.done else s.P["accent"], outline="")
+        rrect(s, 0, 0, w, s.h, r, fill=P["track"], outline="")
+        if s.cur <= 0: return
+        fw = max(s.h, w * s.cur); rrect(s, 0, 0, fw, s.h, r, fill=P["ok"] if s.done else P["accent"], outline="")
+        if s.shine and not s.done and fw > s.h * 3:
+            x0 = s.ph * (fw + s.h * 2) - s.h * 2; a, b = max(x0, r), min(x0 + s.h * 2, fw - r)
+            if b - a > 2: s.create_rectangle(a, 1, b, s.h - 1, fill=lerp(P["accent"], "#ffffff", .4), outline="")
 
 
 class Radar(tk.Canvas):
-    def __init__(s, parent, P):
-        super().__init__(parent, width=48, height=48, bg=parent["bg"], highlightthickness=0); s.P, s.t, s.on = P, 0.0, False; s.draw()
+    def __init__(s, parent):
+        s.sz = px(44); super().__init__(parent, width=s.sz, height=s.sz, bg=parent["bg"], highlightthickness=0); s.t, s.on = 0.0, False; s.draw()
 
     def start(s):
         if not s.on: s.on = True; s.loop()
@@ -105,96 +124,160 @@ class Radar(tk.Canvas):
         else: s.t = 0; s.draw()
 
     def draw(s):
-        s.delete("all"); s.create_oval(19, 19, 29, 29, fill=s.P["accent"], outline="")
+        c, m = s.sz / 2, s.sz / 2; s.delete("all"); s.create_oval(c - m * .2, c - m * .2, c + m * .2, c + m * .2, fill=P["accent"], outline="")
         for k in range(3):
-            f = (s.t + k / 3) % 1 if s.on else .3 + k * .25
-            r = 7 + 17 * f; s.create_oval(24 - r, 24 - r, 24 + r, 24 + r, outline=lerp(s.P["accent"], s.P["bg"], f if s.on else .7), width=2)
+            f = (s.t + k / 3) % 1 if s.on else .3 + k * .25; r = m * (.3 + .7 * f)
+            s.create_oval(c - r, c - r, c + r, c + r, outline=lerp(P["accent"], P["side"], f if s.on else .7), width=2)
 
 
 class RCard(tk.Canvas):
-    """Rounded card: draws a rounded background and hosts widgets in .inner (sized to content)."""
-    def __init__(s, parent, P, fill=None, pad=14, r=16):
-        super().__init__(parent, bg=parent["bg"], highlightthickness=0, height=20)
-        s.P, s.fill, s.pad, s.r, s.edge, s.kids = P, fill or P["card"], pad, r, None, []
-        s.inner = tk.Frame(s, bg=s.fill); s.win = s.create_window(pad, pad, window=s.inner, anchor="nw")
+    """Rounded card (or dashed drop-zone outline) hosting widgets in .inner."""
+    def __init__(s, parent, fill=None, pad=14, r=16, dash=False):
+        super().__init__(parent, bg=parent["bg"], highlightthickness=0, height=px(20))
+        s.fill, s.pad, s.r, s.edge, s.dash, s.ph = fill or P["card"], px(pad), px(r), None, dash, 0
+        s.inner = tk.Frame(s, bg=s.fill); s.win = s.create_window(s.pad, s.pad, window=s.inner, anchor="nw")
         s.inner.bind("<Configure>", lambda e: s.relayout()); s.bind("<Configure>", lambda e: s.relayout())
+        if dash: s.march()
 
     def relayout(s):
         if not s.winfo_exists(): return
         w = max(s.winfo_width(), 2); h = s.inner.winfo_reqheight() + 2 * s.pad
         if int(float(s["height"])) != h: s.configure(height=h)
         s.itemconfigure(s.win, width=max(1, w - 2 * s.pad)); s.delete("bg")
-        rrect(s, 1, 1, w - 1, h - 1, s.r, fill=s.fill, outline=s.edge or s.fill, width=2 if s.edge else 1, tags="bg"); s.tag_lower("bg")
+        if s.dash: rrect(s, 2, 2, w - 2, h - 2, s.r, fill=s.fill, outline=P["accent"], width=2, dash=(px(7), px(5)), tags="bg")
+        else: rrect(s, 1, 1, w - 1, h - 1, s.r, fill=s.fill, outline=s.edge or s.fill, width=2 if s.edge else 1, tags="bg")
+        s.tag_lower("bg")
+
+    def march(s):   # marching-ants border
+        if not s.winfo_exists(): return
+        s.ph = (s.ph + 1) % 12; s.itemconfigure("bg", dashoffset=s.ph); s.after(80, s.march)
 
     def paint(s, fill, edge=None):
-        s.fill, s.edge = fill, edge; s.inner.configure(bg=fill)
-        for k in s.kids:
-            try: k.configure(bg=fill)
+        old = s.fill; s.fill, s.edge = fill, edge; s.inner.configure(bg=fill)
+        for k in _all(s.inner):
+            try:
+                if str(k.cget("bg")).lower() == old.lower(): k.configure(bg=fill)
             except tk.TclError: pass
         s.relayout()
 
 
+def fade_in(card, steps=10):
+    tgt = card.fill
+    def go(i=1):
+        if not card.winfo_exists(): return
+        card.paint(lerp(P["bg"], tgt, i / steps))
+        if i < steps: card.after(18, go, i + 1)
+    go()
+
+
 class ScrollFrame(tk.Frame):
-    def __init__(s, parent, P):
-        super().__init__(parent, bg=P["bg"])
-        s.cv = tk.Canvas(s, bg=P["bg"], highlightthickness=0); s.cv.pack(side="left", fill="both", expand=True)
-        s.inner = tk.Frame(s.cv, bg=P["bg"]); s.win = s.cv.create_window((0, 0), window=s.inner, anchor="nw")
-        s.inner.bind("<Configure>", lambda e: s.cv.configure(scrollregion=s.cv.bbox("all")))
-        s.cv.bind("<Configure>", lambda e: s.cv.itemconfigure(s.win, width=e.width))
-        s.cv.bind_all("<MouseWheel>", lambda e: s.cv.yview_scroll(-1 if e.delta > 0 else 1, "units"))
-        s.cv.bind_all("<Button-4>", lambda e: s.cv.yview_scroll(-1, "units")); s.cv.bind_all("<Button-5>", lambda e: s.cv.yview_scroll(1, "units"))
+    def __init__(s, parent):
+        super().__init__(parent, bg=parent["bg"])
+        s.sb = tk.Canvas(s, width=px(8), bg=parent["bg"], highlightthickness=0); s.sb.pack(side="right", fill="y")
+        s.cv = tk.Canvas(s, bg=parent["bg"], highlightthickness=0, yscrollcommand=s._sync); s.cv.pack(side="left", fill="both", expand=True)
+        s.inner = tk.Frame(s.cv, bg=parent["bg"]); s.win = s.cv.create_window((0, 0), window=s.inner, anchor="nw")
+        s.inner.bind("<Configure>", lambda e: s.cv.configure(scrollregion=s.cv.bbox("all"))); s.cv.bind("<Configure>", lambda e: s.cv.itemconfigure(s.win, width=e.width))
+        s.sb.bind("<B1-Motion>", lambda e: s.cv.yview_moveto(e.y / max(1, s.sb.winfo_height()) - .05)); s.sb.bind("<Button-1>", lambda e: s.cv.yview_moveto(e.y / max(1, s.sb.winfo_height()) - .05))
+
+    def _sync(s, a, b):
+        a, b = float(a), float(b); s.sb.delete("all"); h = s.sb.winfo_height()
+        if b - a < .999: rrect(s.sb, 1, a * h, px(7), max(b * h, a * h + px(28)), px(3), fill=P["track"], outline="")
 
 
 class DevCard(RCard):
-    def __init__(s, parent, P, name, sub, kind, on_toggle):
-        super().__init__(parent, P, pad=12); i = s.inner; s.sel, s.fading = False, True
-        s.ic = Icon(i, "phone" if kind == "Android" else "laptop", 28, P["accent"], P["card"]); s.ic.pack(side="left", padx=(2, 14))
+    def __init__(s, parent, name, sub, kind, on_toggle):
+        super().__init__(parent, pad=11, r=14); i = s.inner; s.sel, s.fading = False, True
+        s.ic = Icon(i, "phone" if kind == "Android" else "laptop", 28, P["accent"], P["card"]); s.ic.pack(side="left", padx=(px(2), px(12)))
         txt = tk.Frame(i, bg=P["card"]); txt.pack(side="left", fill="x", expand=True)
-        s.t1 = tk.Label(txt, text=name, bg=P["card"], fg=P["text"], font=(FONT, 11, "bold"), anchor="w"); s.t1.pack(anchor="w")
-        s.t2 = tk.Label(txt, text=sub, bg=P["card"], fg=P["muted"], font=(FONT, 9), anchor="w"); s.t2.pack(anchor="w")
-        s.ck = Icon(i, "check", 24, P["ok"], P["card"]); s.ck.pack(side="right"); s.ck.delete("all")
-        s.kids = [i, s.ic, txt, s.t1, s.t2, s.ck]
-        for w in (s, i, s.ic, txt, s.t1, s.t2, s.ck):
-            w.configure(cursor="hand2"); w.bind("<Button-1>", lambda e: s.toggle(on_toggle))
-            w.bind("<Enter>", lambda e: s.hover(True)); w.bind("<Leave>", lambda e: s.hover(False))
-        s.anim()
+        tk.Label(txt, text=short(name, 22), bg=P["card"], fg=P["text"], font=F(10, True), anchor="w").pack(anchor="w")
+        tk.Label(txt, text=sub, bg=P["card"], fg=P["muted"], font=F(8), anchor="w").pack(anchor="w")
+        s.ck = Icon(i, "check", 22, P["ok"], P["card"]); s.ck.pack(side="right"); s.ck.delete("all")
+        for w in [s, i, *_all(i)]:
+            w.configure(cursor="hand2"); w.bind("<Button-1>", lambda e: s.toggle(on_toggle)); w.bind("<Enter>", lambda e: s.hover(True)); w.bind("<Leave>", lambda e: s.hover(False))
+        fade_in(s); s.after(220, lambda: setattr(s, "fading", False))
 
     def hover(s, on):
-        if not s.fading and not s.sel: s.paint(s.P["hover"] if on else s.P["card"])
-
-    def anim(s, i=1):
-        if not s.winfo_exists(): return
-        s.paint(lerp(s.P["bg"], s.P["card"], i / 12))
-        if i < 12: s.after(18, s.anim, i + 1)
-        else: s.fading = False
+        if not s.fading and not s.sel: s.paint(P["hover"] if on else P["card"])
 
     def toggle(s, cb):
-        s.sel = not s.sel; s.paint(lerp(s.P["card"], s.P["accent"], .14) if s.sel else s.P["card"], s.P["accent"] if s.sel else None)
-        if s.sel: s.ck.show("check", s.P["ok"])
-        else: s.ck.delete("all")
-        cb()
+        s.sel = not s.sel; s.paint(lerp(P["card"], P["accent"], .16) if s.sel else P["card"], P["accent"] if s.sel else None)
+        s.ck.show("check", P["ok"]) if s.sel else s.ck.delete("all"); cb()
+
+
+class QueueRow(RCard):
+    def __init__(s, parent, entry, on_remove):
+        super().__init__(parent, pad=10, r=14); s.entry = entry; i = s.inner; kind = entry["kind"]
+        Icon(i, {"folder": "folder", "text": "text"}.get(kind, "file"), 24, P["accent"], P["card"]).pack(side="left", padx=(px(2), px(12)))
+        x = Icon(i, "close", 18, P["muted"], P["card"]); x.pack(side="right", padx=(px(8), px(2))); x.configure(cursor="hand2")
+        x.bind("<Button-1>", lambda e: on_remove(s)); x.bind("<Enter>", lambda e: x.show("close", P["err"])); x.bind("<Leave>", lambda e: x.show("close", P["muted"]))
+        mid = tk.Frame(i, bg=P["card"]); mid.pack(side="left", fill="x", expand=True)
+        tk.Label(mid, text=short(entry["name"], 54), bg=P["card"], fg=P["text"], font=F(10, True), anchor="w").pack(anchor="w")
+        meta = f"{entry['count']} files   -   {H.hsize(entry['size'])}" if kind == "folder" else ("Text   -   " if kind == "text" else "") + H.hsize(entry["size"])
+        tk.Label(mid, text=meta, bg=P["card"], fg=P["muted"], font=F(9), anchor="w").pack(anchor="w"); fade_in(s)
 
 
 class XCard(RCard):
-    def __init__(s, parent, P, title, up, on_cancel):
-        super().__init__(parent, P); i = s.inner
+    MAXROWS = 40
+
+    def __init__(s, parent, title, up, on_cancel):
+        super().__init__(parent, pad=14); i = s.inner; s.rows, s.sizes, s.open, s.cancel_cb = [], [], False, on_cancel
         top = tk.Frame(i, bg=P["card"]); top.pack(fill="x")
-        Icon(top, "upload" if up else "download", 20, P["accent"], P["card"]).pack(side="left")
-        s.title = tk.Label(top, text=title, bg=P["card"], fg=P["text"], font=(FONT, 10, "bold")); s.title.pack(side="left", padx=8)
-        x = Icon(top, "close", 18, P["muted"], P["card"]); x.pack(side="right"); x.configure(cursor="hand2"); x.bind("<Button-1>", lambda e: on_cancel())
-        s.bar = Bar(i, P); s.bar.pack(fill="x", pady=(10, 6))
-        s.stat = tk.Label(i, text="Starting...", bg=P["card"], fg=P["muted"], font=(FONT, 9), anchor="w"); s.stat.pack(anchor="w")
+        Icon(top, "upload" if up else "download", 22, P["accent"], P["card"]).pack(side="left")
+        s.title = tk.Label(top, text=title, bg=P["card"], fg=P["text"], font=F(11, True)); s.title.pack(side="left", padx=(px(10), 0))
+        s.count = tk.Label(top, text="", bg=P["card"], fg=P["muted"], font=F(9)); s.count.pack(side="left", padx=(px(10), 0))
+        x = Icon(top, "close", 18, P["muted"], P["card"]); x.pack(side="right"); x.configure(cursor="hand2"); x.bind("<Button-1>", lambda e: s.cancel_cb())
+        s.bar = Bar(i, h=10, shine=True); s.bar.pack(fill="x", pady=(px(12), px(6)))
+        low = tk.Frame(i, bg=P["card"]); low.pack(fill="x")
+        s.stat = tk.Label(low, text="Starting...", bg=P["card"], fg=P["muted"], font=F(9), anchor="w"); s.stat.pack(side="left")
+        s.tog = tk.Label(low, text="", bg=P["card"], fg=P["accent"], font=F(9, True), cursor="hand2"); s.tog.pack(side="right"); s.tog.bind("<Button-1>", lambda e: s.toggle())
+        s.fbox = tk.Frame(i, bg=P["card"]); fade_in(s)
+
+    def set_files(s, names, sizes):
+        for w in s.fbox.winfo_children(): w.destroy()
+        s.rows, s.sizes = [], list(sizes); n = len(names); s.count.configure(text=f"{n} file{'s' if n != 1 else ''}")
+        for k in range(min(n, s.MAXROWS)):
+            f = tk.Frame(s.fbox, bg=P["card"]); f.pack(fill="x", pady=px(3))
+            ic = Icon(f, "text" if names[k] == "Text message" else "file", 18, P["muted"], P["card"]); ic.pack(side="left", anchor="n")
+            mid = tk.Frame(f, bg=P["card"]); mid.pack(side="left", fill="x", expand=True, padx=px(10))
+            tk.Label(mid, text=short(names[k], 56), bg=P["card"], fg=P["text"], font=F(9), anchor="w").pack(anchor="w")
+            bar = Bar(mid, h=5); bar.pack(fill="x", pady=(px(3), 0))
+            st = tk.Label(f, text="", bg=P["card"], fg=P["muted"], font=F(9), width=7, anchor="e"); st.pack(side="right")
+            s.rows.append(dict(ic=ic, bar=bar, st=st, last=-1, done=False))
+        if n > s.MAXROWS: tk.Label(s.fbox, text=f"... and {n - s.MAXROWS} more", bg=P["card"], fg=P["muted"], font=F(9)).pack(anchor="w", pady=px(4))
+        s.open = n <= 4; s._show()
+
+    def _show(s):
+        if s.open: s.fbox.pack(fill="x", pady=(px(10), 0))
+        else: s.fbox.pack_forget()
+        s.tog.configure(text=("Hide files" if s.open else f"Show files ({len(s.sizes)})") if s.sizes else "")
+
+    def toggle(s): s.open = not s.open; s._show()
+
+    def update_files(s, fdone, all_done=False):
+        for k, r in enumerate(s.rows):
+            size, d = s.sizes[k], (fdone[k] if k < len(fdone) else 0); done = all_done or (size > 0 and d >= size)
+            key = -2 if done else (int(100 * d / size) if size else 0)
+            if key == r["last"]: continue
+            r["last"] = key
+            if done:
+                r["bar"].set(1, True); r["st"].configure(text="Done", fg=P["ok"])
+                if not r["done"]: r["done"] = True; r["ic"].show("check", P["ok"])
+            else:
+                r["bar"].set(d / size if size else 0); r["st"].configure(text=f"{key}%" if size else "", fg=P["muted"])
 
 
+# ============================ application ============================
 def main():
-    cfg = H.load_cfg(); P = DARK if cfg["theme"] == "dark" else LIGHT
-    os.makedirs(cfg["folder"], exist_ok=True); H.clean_partials(cfg["folder"])
-    root = tk.Tk(); root.title("HotShare"); root.geometry("780x860"); root.configure(bg=P["bg"]); root.minsize(620, 640)
+    WIN.dpi_aware()
+    cfg = H.load_cfg(); os.makedirs(cfg["folder"], exist_ok=True); H.clean_partials(cfg["folder"])
+    cfg["theme"] = {"dark": "Midnight", "light": "Daylight"}.get(cfg["theme"], cfg["theme"])
+    root = tk.Tk(); root.title("HotShare"); SC[0] = max(1.0, float(root.winfo_fpixels("1i")) / 96.0); FONT[0] = pick_font(root); apply_theme(cfg["theme"])
+    root.geometry(f"{px(1080)}x{px(740)}"); root.minsize(px(900), px(600))
     try: root.iconbitmap(res("icon.ico"))
     except Exception:
-        try: root.iconphoto(True, tk.PhotoImage(file=res("logo.png")))
+        try: root.iconphoto(True, tk.PhotoImage(file=res("logo2.png")))
         except Exception: pass
-    q = queue.Queue(); devices, cards, active, selected = {}, {}, [], set()
+    q = queue.Queue(); devices, cards, done_, active, selected, queue_, W = {}, {}, {}, [], set(), [], {}
 
     def ui(fn, *a): q.put((fn, a))
     def pump():
@@ -207,10 +290,10 @@ def main():
         root.after(25, pump)
 
     def toast(msg):
-        t = tk.Label(root, text=msg, bg=P["accent"], fg="#ffffff", font=(FONT, 10, "bold"), padx=20, pady=10)
+        t = tk.Label(root, text=msg, bg=P["accent"], fg="#ffffff", font=F(10, True), padx=px(22), pady=px(10))
         def mv(i, up):
             if not t.winfo_exists(): return
-            e = 1 - (1 - i / 10) ** 3; t.place(relx=.5, rely=1.0, anchor="s", y=int(60 - 100 * e if up else -40 + 100 * e))
+            e = 1 - (1 - i / 10) ** 3; t.place(relx=.5, rely=1.0, anchor="s", y=int(px(60) - px(100) * e if up else -px(40) + px(100) * e))
             if i < 10: root.after(16, mv, i + 1, up)
             elif up: root.after(2400, mv, 0, False)
             else: t.destroy()
@@ -218,130 +301,139 @@ def main():
 
     def log(m): ui(toast, m)
 
-    # ---------- layout ----------
-    foot = tk.Frame(root, bg=P["bg"]); foot.pack(side="bottom", fill="x", padx=22, pady=14)
-    sf = ScrollFrame(root, P); sf.pack(fill="both", expand=True); body = sf.inner
+    def dialog(title):
+        d = tk.Toplevel(root); d.title(title); d.configure(bg=P["bg"]); d.transient(root); WIN.style_titlebar(d, P["bg"], P["text"], P["accent"], P["dark"]); return d
 
-    hdr = tk.Frame(body, bg=P["bg"]); hdr.pack(fill="x", padx=22, pady=(20, 4))
-    try: logo = tk.PhotoImage(file=res("logo.png")); lg = tk.Label(hdr, image=logo, bg=P["bg"]); lg.image = logo; lg.pack(side="left", padx=(0, 14))
-    except Exception: Icon(hdr, "exchange", 40, P["accent"]).pack(side="left", padx=(0, 14))
-    left = tk.Frame(hdr, bg=P["bg"]); left.pack(side="left")
-    tk.Label(left, text="HotShare", bg=P["bg"], fg=P["text"], font=(FONT, 22, "bold")).pack(anchor="w")
-    tk.Label(left, text=f"{cfg['name']}   -   {', '.join(H.local_ips()) or 'no network'}", bg=P["bg"], fg=P["muted"], font=(FONT, 9)).pack(anchor="w")
-    radar = Radar(hdr, P); radar.pack(side="right")
+    def label(parent, text, size=9, bold=False, color=None, **kw):
+        return tk.Label(parent, text=text, bg=parent["bg"], fg=color or P["muted"], font=F(size, bold), **kw)
 
-    def section(text, btns=()):
-        f = tk.Frame(body, bg=P["bg"]); f.pack(fill="x", padx=22, pady=(20, 8))
-        tk.Label(f, text=text.upper(), bg=P["bg"], fg=P["muted"], font=(FONT, 9, "bold")).pack(side="left")
-        for t, ic, c in reversed(btns): RBtn(f, t, c, P, h=30, icon=ic).pack(side="right", padx=3)
-        return f
+    # ------------------------------ queue ------------------------------
+    def build_entry(p):
+        p = os.path.normpath(p.strip().strip('"'))
+        if not (os.path.isdir(p) or os.path.isfile(p)): return None
+        items = H.collect([p])
+        return dict(kind="folder" if os.path.isdir(p) else "file", name=os.path.basename(p) or p, path=p, items=items, size=sum(i["size"] for i in items), count=len(items)) if items else None
 
-    # ---------- receive-into card (folder chooser) ----------
-    sc = RCard(body, P); sc.pack(fill="x", padx=22, pady=(14, 0)); si = sc.inner
-    Icon(si, "folder", 28, P["accent"], P["card"]).pack(side="left", padx=(2, 14))
-    col = tk.Frame(si, bg=P["card"]); col.pack(side="left", fill="x", expand=True)
-    tk.Label(col, text="RECEIVE INTO", bg=P["card"], fg=P["muted"], font=(FONT, 8, "bold"), anchor="w").pack(anchor="w")
-    pathlbl = tk.Label(col, text=short(cfg["folder"]), bg=P["card"], fg=P["text"], font=(FONT, 11, "bold"), anchor="w"); pathlbl.pack(anchor="w")
-
-    def open_inbox():
-        try: os.startfile(cfg["folder"]) if os.name == "nt" else os.system(f'xdg-open "{cfg["folder"]}" &')
-        except OSError: pass
-
-    def choose_folder():
-        f = filedialog.askdirectory(title="Choose where received files are saved", initialdir=cfg["folder"], parent=root)
-        if f:
-            cfg["folder"] = os.path.normpath(f); os.makedirs(cfg["folder"], exist_ok=True); H.save_cfg(cfg)
-            pathlbl.configure(text=short(cfg["folder"])); toast("Saving received files to " + os.path.basename(cfg["folder"]))
-    RBtn(si, "Open", open_inbox, P, h=34, icon="tray").pack(side="right", padx=(8, 0))
-    RBtn(si, "Change", choose_folder, P, h=34, icon="folder", primary=True).pack(side="right")
-
-    # ---------- devices ----------
-    def refresh():
-        radar.start()
+    def add_paths(paths):
         def w():
-            r = H.scan(); ui(show_devices, r)
+            es = [e for e in (build_entry(p) for p in paths) if e and not any(x["path"] == e["path"] for x in queue_)]
+            ui(add_entries, es)
         threading.Thread(target=w, daemon=True).start()
 
-    def show_devices(r):
-        radar.stop(); devices.clear(); devices.update(r); selected.clear()
-        for w in devbox.winfo_children(): w.destroy()
-        if not r:
-            e = tk.Frame(devbox, bg=P["bg"]); e.pack(pady=14); Icon(e, "radar", 34, P["muted"]).pack()
-            tk.Label(e, text="No devices found", bg=P["bg"], fg=P["text"], font=(FONT, 11, "bold")).pack(pady=(6, 0))
-            tk.Label(e, text="Join the same hotspot / Wi-Fi, open HotShare on the other device, then Scan.", bg=P["bg"], fg=P["muted"], font=(FONT, 9)).pack()
-        for ip, (n, p, o) in r.items():
-            DevCard(devbox, P, n, f"{ip}   -   {o or 'device'}", o, lambda ip=ip: selected.symmetric_difference_update({ip})).pack(fill="x", pady=4)
+    def add_entries(es):
+        if not es: return toast("Nothing new to add")
+        for e in es: queue_.append(e); QueueRow(W["qbox"], e, remove_row).pack(fill="x", pady=px(4))
+        sync_queue()
 
-    def add_ip():
-        d = tk.Toplevel(root); d.title("Add device by IP"); d.configure(bg=P["bg"]); d.transient(root)
-        tk.Label(d, text="IP address of the other device", bg=P["bg"], fg=P["muted"], font=(FONT, 9)).pack(padx=22, pady=(18, 4), anchor="w")
-        e = tk.Entry(d, bg=P["card2"], fg=P["text"], insertbackground=P["text"], relief="flat", font=(FONT, 12), width=28); e.pack(padx=22, ipady=7); e.focus()
-        def ok():
-            ip = e.get().strip()
-            if ip: devices[ip] = ("Manual", cfg["port"], "IP"); show_devices(dict(devices))
+    def add_text(t):
+        b = t.encode(); queue_.append(dict(kind="text", name=short(t.strip().splitlines()[0], 60), path=None, text=t, items=[H.text_item(t)], size=len(b), count=1))
+        QueueRow(W["qbox"], queue_[-1], remove_row).pack(fill="x", pady=px(4)); sync_queue()
+
+    def remove_row(row): queue_.remove(row.entry); row.destroy(); sync_queue()
+    def clear_queue():
+        queue_.clear()
+        for w in W["qbox"].winfo_children():
+            if isinstance(w, QueueRow): w.destroy()
+        sync_queue()
+
+    def sync_queue():
+        n = sum(e["count"] for e in queue_); size = sum(e["size"] for e in queue_)
+        W["qcount"].configure(text=f"{len(queue_)} item(s)" if queue_ else "")
+        if queue_: W["qempty"].pack_forget()
+        else: W["qempty"].pack(anchor="w", pady=px(6))
+        tg = [devices[ip][0] for ip in selected if ip in devices]
+        to = ("   to   " + ", ".join(short(t, 16) for t in tg[:2]) + (f" +{len(tg) - 2}" if len(tg) > 2 else "")) if tg else "   -   select a device on the left"
+        W["info"].configure(text=(f"{n} file(s)   -   {H.hsize(size)}" + to) if queue_ else "Nothing to send yet")
+
+    def paste():
+        files = WIN.clipboard_files()
+        if files: add_paths(files); return toast(f"Pasting {len(files)} item(s) from clipboard")
+        try: t = root.clipboard_get()
+        except tk.TclError: t = ""
+        if not t.strip(): return toast("Clipboard is empty")
+        add_paths([t]) if os.path.exists(t.strip().strip('"')) else add_text(t)
+
+    def pick_files():
+        f = filedialog.askopenfilenames(title="Choose files to send", parent=root)
+        if f: add_paths(list(f))
+
+    def pick_folder():
+        f = filedialog.askdirectory(title="Choose a folder to send", parent=root)
+        if f: add_paths([f])
+
+    def add_text_dialog():
+        d = dialog("Add text"); t = tk.Text(d, width=52, height=8, bg=P["card"], fg=P["text"], insertbackground=P["text"], relief="flat", padx=px(12), pady=px(12), font=F(10)); t.pack(padx=px(22), pady=(px(20), px(10)))
+        try: t.insert("1.0", root.clipboard_get())
+        except tk.TclError: pass
+        def go():
+            v = t.get("1.0", "end").strip()
+            if v: add_text(v)
             d.destroy()
-        RBtn(d, "Add device", ok, P, primary=True, icon="plus").pack(pady=16); e.bind("<Return>", lambda ev: ok())
+        RBtn(d, "Add to list", go, primary=True, icon="plus").pack(pady=(0, px(18)))
 
-    section("Nearby devices", [("Scan", "radar", refresh), ("Add IP", "plus", add_ip)])
-    devbox = tk.Frame(body, bg=P["bg"]); devbox.pack(fill="x", padx=22)
-
-    # ---------- transfers plumbing ----------
-    def new_ctl(label):
-        c = H.Ctl(cfg, ask, lambda *a: ui(on_prog, c, *a), log, on_text, hist); c.label = label; active.append(c); return c
-
+    # ------------------------------ transfers ------------------------------
+    def title_of(c): return ("From " if c.incoming and c.label != "Incoming" else "") + c.label
     def make_card(c):
-        card = XCard(xbox, P, c.label, not c.incoming, c.cancel.set); card.pack(fill="x", pady=5); cards[c] = card; return card
+        card = XCard(W["xbox"], title_of(c), not c.incoming, c.cancel.set); card.pack(fill="x", pady=px(6)); cards[c] = card; return card
+
+    def on_files(c):
+        card = cards.get(c) or make_card(c); card.title.configure(text=title_of(c)); card.set_files(c.names, c.sizes)
 
     def on_prog(c, d, t, sp, eta):
-        card = cards.get(c) or make_card(c); card.title.configure(text=c.label); card.bar.set(d / t if t else 0)
-        card.stat.configure(text=f"{H.hsize(d)} of {H.hsize(t)}   -   {H.hsize(sp)}/s   -   {int(eta)}s left" if sp else "Finishing...")
+        card = cards.get(c) or make_card(c); card.title.configure(text=title_of(c)); card.bar.set(d / t if t else 0)
+        card.stat.configure(text=f"{H.hsize(d)} of {H.hsize(t)}   -   {H.hsize(sp)}/s   -   {int(eta)}s left" if sp else "Finishing...", fg=P["muted"]); card.update_files(c.fdone)
+
+    def remove_card(c):
+        card = cards.pop(c, None); done_.pop(c, None)
+        if card is not None and card.winfo_exists(): card.destroy()
+
+    def paint_done(card, c, ok, msg):
+        card.title.configure(text=title_of(c)); card.bar.set(1 if ok else card.bar.cur, done=ok); card.update_files(c.fdone, all_done=ok)
+        card.stat.configure(text=("Done - " if ok else "Stopped - ") + msg, fg=P["ok"] if ok else P["err"]); card.cancel_cb = lambda: remove_card(c)
 
     def finish(c, ok, msg):
-        card = cards.get(c) or make_card(c); card.title.configure(text=c.label)
-        card.bar.set(1 if ok else card.bar.cur, done=ok); card.stat.configure(text=("Done - " if ok else "Stopped - ") + msg, fg=P["ok"] if ok else P["err"])
-        root.after(9000, lambda: (card.destroy(), cards.pop(c, None)))
+        card = cards.get(c) or make_card(c); done_[c] = (ok, msg); paint_done(card, c, ok, msg); root.after(15000, remove_card, c)
         if ok and c.got and cfg["open_after"] and c.incoming: open_inbox()
 
     def hist(d, name, size, peer):
         cfg["history"] = (cfg["history"] + [[time.strftime("%Y-%m-%d %H:%M"), d, name, size, peer]])[-200:]
 
+    def new_ctl(label, incoming):
+        c = H.Ctl(cfg, ask, lambda *a: ui(on_prog, c, *a), log, on_text, hist); c.label, c.incoming = label, incoming; c.on_files = lambda: ui(on_files, c); active.append(c); return c
+
     def on_text(peer, txt):
         def f():
-            root.clipboard_clear(); root.clipboard_append(txt)
-            w = tk.Toplevel(root); w.title(f"Text from {peer}"); w.configure(bg=P["bg"])
-            tk.Label(w, text=f"Text from {peer}", bg=P["bg"], fg=P["muted"], font=(FONT, 9)).pack(padx=22, pady=(16, 4), anchor="w")
-            tk.Label(w, text=txt[:2000], bg=P["card"], fg=P["text"], wraplength=440, justify="left", padx=16, pady=14, font=(FONT, 10)).pack(padx=22)
-            tk.Label(w, text="Copied to clipboard", bg=P["bg"], fg=P["ok"], font=(FONT, 9, "bold")).pack(pady=(10, 16))
+            root.clipboard_clear(); root.clipboard_append(txt); w = dialog(f"Text from {peer}")
+            label(w, f"Text from {peer}").pack(padx=px(22), pady=(px(16), px(4)), anchor="w")
+            tk.Label(w, text=txt[:2000], bg=P["card"], fg=P["text"], wraplength=px(460), justify="left", padx=px(16), pady=px(14), font=F(10)).pack(padx=px(22))
+            label(w, "Copied to clipboard", 9, True, P["ok"]).pack(pady=(px(10), px(16)))
         ui(f)
 
     def ask(h, n, total):
-        ev, res_, folder = threading.Event(), [], [None]
+        ev, out, folder = threading.Event(), [], [None]
         def dlg():
-            d = tk.Toplevel(root); d.title("Incoming transfer"); d.configure(bg=P["bg"]); d.transient(root)
-            Icon(d, "download", 34, P["accent"]).pack(pady=(20, 6))
-            tk.Label(d, text=f"{h.get('name')} wants to send", bg=P["bg"], fg=P["muted"], font=(FONT, 10)).pack(padx=28)
-            tk.Label(d, text=f"{n} item(s)  -  {H.hsize(total)}", bg=P["bg"], fg=P["text"], font=(FONT, 16, "bold")).pack(padx=28)
-            fl = tk.Label(d, text="Save to: " + short(cfg["folder"], 50), bg=P["bg"], fg=P["muted"], font=(FONT, 9)); fl.pack(pady=(10, 4))
+            d = dialog("Incoming transfer"); Icon(d, "download", 34, P["accent"]).pack(pady=(px(22), px(6)))
+            label(d, f"{h.get('name')} wants to send", 10).pack(padx=px(30))
+            label(d, f"{n} item(s)   -   {H.hsize(total)}", 16, True, P["text"]).pack(padx=px(30))
+            fl = label(d, "Save to: " + short(cfg["folder"], 50)); fl.pack(pady=(px(10), px(4)))
             def change():
                 f = filedialog.askdirectory(parent=d, initialdir=cfg["folder"], title="Save this transfer to...")
                 if f: folder[0] = f; fl.configure(text="Save to: " + short(f, 50))
-            RBtn(d, "Choose folder", change, P, h=30, icon="folder").pack(pady=4)
-            def pick(v): res_.append(v); ev.set(); d.destroy()
-            row = tk.Frame(d, bg=P["bg"]); row.pack(pady=18, padx=20)
-            for t, v, pr in (("Accept", "once", True), ("Always", "always", False), ("Decline", None, False)): RBtn(row, t, lambda v=v: pick(v), P, w=96, primary=pr).pack(side="left", padx=4)
+            RBtn(d, "Choose folder", change, h=30, icon="folder").pack(pady=px(4))
+            def pick(v): out.append(v); ev.set(); d.destroy()
+            row = tk.Frame(d, bg=P["bg"]); row.pack(pady=px(20), padx=px(22))
+            for t, v, pr in (("Accept", "once", True), ("Always", "always", False), ("Decline", None, False)): RBtn(row, t, lambda v=v: pick(v), w=100, primary=pr).pack(side="left", padx=px(4))
             d.protocol("WM_DELETE_WINDOW", lambda: pick(None))
         ui(dlg); ev.wait(120)
-        return (res_[0] if res_ else None), folder[0]
+        return (out[0] if out else None), folder[0]
 
     def server():
-        try:
-            s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("", cfg["port"])); s.listen(32)
-        except Exception as e:
-            return ui(toast, f"Cannot receive: {e} (is the port already in use?)")
+        try: s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("", cfg["port"])); s.listen(32)
+        except Exception as e: return ui(toast, f"Cannot receive: {e} (is the port already in use?)")
         while True:
             c, _ = s.accept()
             def run(c=c):
-                ctl = new_ctl("Incoming"); ctl.incoming = True
+                ctl = new_ctl("Incoming", True)
                 try:
                     H.handle(c, ctl)
                     if ctl.label != "Incoming": ui(finish, ctl, not ctl.declined, "Declined" if ctl.declined else (f"received {ctl.got} file(s)" if ctl.got else "text received"))
@@ -353,74 +445,189 @@ def main():
                     active.remove(ctl); H.save_cfg(cfg)
             threading.Thread(target=run, daemon=True).start()
 
-    def do_send(items):
+    def send_queue():
         t = [(ip, devices[ip][1], devices[ip][0]) for ip in selected if ip in devices]
-        if not items: return
-        if not t: return toast("Select a device first")
+        if not queue_: return toast("Add files, a folder or text first")
+        if not t: return toast("Select a device on the left first")
+        items = [it for e in queue_ for it in e["items"]]; dest = W["dest"].get().strip()
         for ip, port, name in t:
             def w(ip=ip, port=port, name=name):
-                ctl = new_ctl("To " + name); ctl.incoming = False
-                try: H.send(ip, port, items, ctl, dest.get().strip()); ui(finish, ctl, True, "sent")
+                ctl = new_ctl("To " + name, False)
+                try: H.send(ip, port, items, ctl, dest); ui(finish, ctl, True, "sent")
                 except InterruptedError: ui(finish, ctl, False, "cancelled")
                 except Exception as e: ui(finish, ctl, False, str(e))
                 finally: active.remove(ctl); H.save_cfg(cfg)
             threading.Thread(target=w, daemon=True).start()
+        clear_queue()
 
-    def send_text():
-        d = tk.Toplevel(root); d.title("Send text"); d.configure(bg=P["bg"]); d.transient(root)
-        t = tk.Text(d, width=50, height=8, bg=P["card"], fg=P["text"], insertbackground=P["text"], relief="flat", padx=12, pady=12, font=(FONT, 10)); t.pack(padx=22, pady=(20, 10))
-        try: t.insert("1.0", root.clipboard_get())
-        except tk.TclError: pass
-        def go():
-            v = t.get("1.0", "end").strip()
-            if v: do_send([H.text_item(v)])
+    # ------------------------------ devices ------------------------------
+    def refresh():
+        W["radar"].start()
+        def w():
+            r = H.scan(port=cfg["port"]); ui(show_devices, r)
+        threading.Thread(target=w, daemon=True).start()
+
+    def show_devices(r, keep=False):
+        W["radar"].stop(); devices.clear(); devices.update(r)
+        if not keep: selected.clear()
+        else: selected.intersection_update(devices)
+        box = W["devbox"]
+        for w in box.winfo_children(): w.destroy()
+        if not r:
+            e = tk.Frame(box, bg=P["side"]); e.pack(pady=px(18)); Icon(e, "radar", 36, P["muted"], P["side"]).pack()
+            label(e, "No devices found", 11, True, P["text"]).pack(pady=(px(8), px(2)))
+            label(e, "Join the same hotspot / Wi-Fi and open\nHotShare on the other device, then Scan.", 9, justify="center").pack()
+        for ip, (n, p, o) in r.items():
+            c = DevCard(box, n, f"{ip}   -   {o or 'device'}", o, lambda ip=ip: (selected.symmetric_difference_update({ip}), sync_queue())); c.pack(fill="x", pady=px(4))
+            if ip in selected: c.toggle(lambda: None)
+        sync_queue()
+
+    def add_ip():
+        d = dialog("Add device by IP"); label(d, "IP address of the other device").pack(padx=px(22), pady=(px(18), px(4)), anchor="w")
+        e = tk.Entry(d, bg=P["card2"], fg=P["text"], insertbackground=P["text"], relief="flat", font=F(12), width=26); e.pack(padx=px(22), ipady=px(7)); e.focus()
+        def ok():
+            ip = e.get().strip()
+            if ip: devices[ip] = ("Manual", cfg["port"], "IP"); show_devices(dict(devices), keep=True)
             d.destroy()
-        RBtn(d, "Send", go, P, primary=True, icon="send").pack(pady=(0, 18))
+        RBtn(d, "Add device", ok, primary=True, icon="plus").pack(pady=px(16)); e.bind("<Return>", lambda ev: ok())
 
-    # ---------- send ----------
-    section("Send")
-    sc2 = RCard(body, P); sc2.pack(fill="x", padx=22); s2 = sc2.inner
-    row = tk.Frame(s2, bg=P["card"]); row.pack(fill="x")
-    for t, ic, c in (("Files", "file", lambda: do_send(H.collect(filedialog.askopenfilenames(title="Choose files to send")))),
-                     ("Folder", "folder", lambda: do_send(H.collect([filedialog.askdirectory(title="Choose a folder to send")]))), ("Text", "text", send_text)):
-        RBtn(row, t, c, P, h=42, primary=True, icon=ic, w=128).pack(side="left", padx=(0, 10))
-    tk.Label(s2, text="Put it into this subfolder on the other device (optional)", bg=P["card"], fg=P["muted"], font=(FONT, 9)).pack(anchor="w", pady=(14, 4))
-    dest = tk.Entry(s2, bg=P["card2"], fg=P["text"], insertbackground=P["text"], relief="flat", font=(FONT, 10)); dest.pack(fill="x", ipady=7)
+    # ------------------------------ folder / dialogs ------------------------------
+    def open_inbox():
+        try: os.startfile(cfg["folder"]) if os.name == "nt" else os.system(f'xdg-open "{cfg["folder"]}" &')
+        except OSError: pass
 
-    section("Transfers", [("Cancel all", "close", lambda: [c.cancel.set() for c in active])])
-    xbox = tk.Frame(body, bg=P["bg"]); xbox.pack(fill="x", padx=22, pady=(0, 20))
+    def choose_folder():
+        f = filedialog.askdirectory(title="Choose where received files are saved", initialdir=cfg["folder"], parent=root)
+        if f:
+            cfg["folder"] = os.path.normpath(f); os.makedirs(cfg["folder"], exist_ok=True); H.save_cfg(cfg)
+            W["path"].configure(text=short(cfg["folder"], 30)); toast("Receiving into " + os.path.basename(cfg["folder"]))
 
-    # ---------- history / settings ----------
     def show_hist():
-        w = tk.Toplevel(root); w.title("History"); w.configure(bg=P["bg"]); w.geometry("660x440")
-        l = tk.Listbox(w, bg=P["card"], fg=P["text"], relief="flat", highlightthickness=0, font=(FONT, 10), selectbackground=P["accent"]); l.pack(fill="both", expand=True, padx=16, pady=16)
+        w = dialog("History"); w.geometry(f"{px(680)}x{px(440)}")
+        l = tk.Listbox(w, bg=P["card"], fg=P["text"], relief="flat", highlightthickness=0, font=F(10), selectbackground=P["accent"]); l.pack(fill="both", expand=True, padx=px(16), pady=px(16))
         if not cfg["history"]: l.insert("end", "  Nothing transferred yet.")
         for t, d, n, s, p in reversed(cfg["history"]): l.insert("end", f"  {t}    {'Received from' if d == 'in' else 'Sent to'} {p}    {n}    ({H.hsize(s)})")
 
     def settings():
-        w = tk.Toplevel(root); w.title("Settings"); w.configure(bg=P["bg"]); w.transient(root)
-        v = {k: tk.StringVar(value=str(cfg[k])) for k in ("name", "folder", "port", "pin", "retries")}
-        b = {k: tk.BooleanVar(value=cfg[k]) for k in ("auto", "visible", "open_after")}; th = tk.StringVar(value=cfg["theme"])
-        rows = (("name", "Device name"), ("folder", "Save folder"), ("port", "Port"), ("pin", "Shared PIN"), ("retries", "Auto-resume attempts"))
-        for i, (k, l) in enumerate(rows):
-            tk.Label(w, text=l, bg=P["bg"], fg=P["muted"], font=(FONT, 9)).grid(row=i, column=0, sticky="w", padx=22, pady=7)
-            tk.Entry(w, textvariable=v[k], width=34, bg=P["card2"], fg=P["text"], insertbackground=P["text"], relief="flat").grid(row=i, column=1, padx=6, ipady=5)
-        RBtn(w, "Browse", lambda: v["folder"].set(filedialog.askdirectory(parent=w) or v["folder"].get()), P, h=30, icon="folder").grid(row=1, column=2, padx=10)
+        w = dialog("Settings")
+        v = {k: tk.StringVar(value=str(cfg[k])) for k in ("name", "folder", "port", "pin", "retries")}; b = {k: tk.BooleanVar(value=cfg[k]) for k in ("auto", "visible", "open_after")}
+        for i, (k, l) in enumerate((("name", "Device name"), ("folder", "Save folder"), ("port", "Port"), ("pin", "Shared PIN"), ("retries", "Auto-resume attempts"))):
+            label(w, l).grid(row=i, column=0, sticky="w", padx=px(22), pady=px(7))
+            tk.Entry(w, textvariable=v[k], width=34, bg=P["card2"], fg=P["text"], insertbackground=P["text"], relief="flat", font=F(10)).grid(row=i, column=1, padx=px(6), ipady=px(5))
+        RBtn(w, "Browse", lambda: v["folder"].set(filedialog.askdirectory(parent=w) or v["folder"].get()), h=30, icon="folder").grid(row=1, column=2, padx=px(10))
         for j, (k, l) in enumerate((("visible", "Visible to nearby devices"), ("auto", "Auto-accept everything"), ("open_after", "Open folder after receiving"))):
-            tk.Checkbutton(w, text=l, variable=b[k], bg=P["bg"], fg=P["text"], selectcolor=P["card"], activebackground=P["bg"], activeforeground=P["text"]).grid(row=5 + j, column=1, sticky="w", pady=2)
-        tk.Label(w, text="Theme (restart)", bg=P["bg"], fg=P["muted"], font=(FONT, 9)).grid(row=8, column=0, sticky="w", padx=22); tk.OptionMenu(w, th, "dark", "light").grid(row=8, column=1, sticky="w", pady=6)
-        RBtn(w, f"Clear trusted devices ({len(cfg['trusted'])})", lambda: (cfg["trusted"].clear(), H.save_cfg(cfg)), P, h=30).grid(row=9, column=1, sticky="w", pady=6)
+            tk.Checkbutton(w, text=l, variable=b[k], bg=P["bg"], fg=P["text"], selectcolor=P["card"], activebackground=P["bg"], activeforeground=P["text"], font=F(10)).grid(row=5 + j, column=1, sticky="w", pady=px(2))
+        RBtn(w, f"Clear trusted devices ({len(cfg['trusted'])})", lambda: (cfg["trusted"].clear(), H.save_cfg(cfg)), h=30).grid(row=8, column=1, sticky="w", pady=px(8))
         def ok():
             try: port, ret = int(v["port"].get()), int(v["retries"].get())
             except ValueError: return toast("Port and attempts must be numbers")
-            cfg.update(name=v["name"].get(), folder=v["folder"].get(), port=port, pin=v["pin"].get(), retries=ret, theme=th.get(), **{k: b[k].get() for k in b})
-            os.makedirs(cfg["folder"], exist_ok=True); H.save_cfg(cfg); pathlbl.configure(text=short(cfg["folder"])); w.destroy(); toast("Saved (restart to apply port/theme)")
-        RBtn(w, "Save", ok, P, primary=True, icon="check").grid(row=10, column=1, pady=16, sticky="w")
+            cfg.update(name=v["name"].get(), folder=v["folder"].get(), port=port, pin=v["pin"].get(), retries=ret, **{k: b[k].get() for k in b})
+            os.makedirs(cfg["folder"], exist_ok=True); H.save_cfg(cfg); W["path"].configure(text=short(cfg["folder"], 30)); w.destroy(); toast("Saved (restart to apply a new port)")
+        RBtn(w, "Save", ok, primary=True, icon="check").grid(row=9, column=1, pady=px(16), sticky="w")
 
-    RBtn(foot, "History", show_hist, P, icon="history").pack(side="left", padx=(0, 8))
-    RBtn(foot, "Settings", settings, P, icon="sliders").pack(side="left")
+    def set_theme(name):
+        if name == cfg["theme"]: return
+        cfg["theme"] = name; H.save_cfg(cfg); apply_theme(name); build(); toast("Theme: " + name)
 
-    pump(); threading.Thread(target=server, daemon=True).start(); threading.Thread(target=H.discovery_server, args=(cfg,), daemon=True).start()
+    # ------------------------------ layout ------------------------------
+    def build():
+        for w in root.winfo_children(): w.destroy()
+        cards.clear(); root.configure(bg=P["bg"])
+        side = tk.Frame(root, bg=P["side"], width=px(330)); side.pack(side="left", fill="y"); side.pack_propagate(False)
+        tk.Frame(root, bg=P["line"], width=1).pack(side="left", fill="y")
+        mainf = tk.Frame(root, bg=P["bg"]); mainf.pack(side="left", fill="both", expand=True)
+
+        # --- sidebar: brand ---
+        bf = tk.Frame(side, bg=P["side"]); bf.pack(fill="x", padx=px(20), pady=(px(22), px(6)))
+        try:
+            nm = min(("logo.png", "logo2.png", "logo3.png"), key=lambda f: abs({"logo.png": 44, "logo2.png": 66, "logo3.png": 88}[f] - 44 * SC[0])); img = tk.PhotoImage(file=res(nm))
+            lg = tk.Label(bf, image=img, bg=P["side"]); lg.image = img; lg.pack(side="left", padx=(0, px(14)))
+        except Exception: Icon(bf, "exchange", 40, P["accent"], P["side"]).pack(side="left", padx=(0, px(14)))
+        t = tk.Frame(bf, bg=P["side"]); t.pack(side="left", fill="x", expand=True)
+        tk.Label(t, text="HotShare", bg=P["side"], fg=P["text"], font=F(17, True), anchor="w").pack(anchor="w")
+        tk.Label(t, text=short(f"{cfg['name']}  -  {', '.join(H.local_ips()[:1]) or 'no network'}", 34), bg=P["side"], fg=P["muted"], font=F(9), anchor="w").pack(anchor="w")
+
+        # --- sidebar: receive-into card ---
+        rc = RCard(side, pad=14); rc.pack(fill="x", padx=px(18), pady=(px(14), 0)); ri = rc.inner
+        top = tk.Frame(ri, bg=P["card"]); top.pack(fill="x")
+        Icon(top, "folder", 26, P["accent"], P["card"]).pack(side="left", padx=(0, px(12)))
+        col = tk.Frame(top, bg=P["card"]); col.pack(side="left", fill="x", expand=True)
+        tk.Label(col, text="RECEIVE INTO", bg=P["card"], fg=P["muted"], font=F(8, True), anchor="w").pack(anchor="w")
+        W["path"] = tk.Label(col, text=short(cfg["folder"], 30), bg=P["card"], fg=P["text"], font=F(10, True), anchor="w"); W["path"].pack(anchor="w")
+        br = tk.Frame(ri, bg=P["card"]); br.pack(fill="x", pady=(px(12), 0))
+        RBtn(br, "Change", choose_folder, h=32, icon="folder", primary=True).pack(side="left", padx=(0, px(8))); RBtn(br, "Open", open_inbox, h=32, icon="tray").pack(side="left")
+
+        # --- sidebar: devices ---
+        dh = tk.Frame(side, bg=P["side"]); dh.pack(fill="x", padx=px(20), pady=(px(20), px(8)))
+        tk.Label(dh, text="NEARBY DEVICES", bg=P["side"], fg=P["muted"], font=F(9, True)).pack(side="left")
+        W["radar"] = Radar(dh); W["radar"].pack(side="right", padx=(px(6), 0)); RBtn(dh, "Scan", refresh, h=30, icon="radar").pack(side="right")
+        RBtn(dh, "", add_ip, w=30, h=30, icon="plus").pack(side="right", padx=px(6))
+        foot = tk.Frame(side, bg=P["side"]); foot.pack(side="bottom", fill="x", padx=px(18), pady=px(16))
+        sf = ScrollFrame(side); sf.pack(fill="both", expand=True, padx=px(14)); W["devbox"] = sf.inner
+
+        # --- sidebar: footer (themes + history/settings) ---
+        sw = tk.Frame(foot, bg=P["side"]); sw.pack(fill="x", pady=(0, px(12)))
+        for name in THEME_ORDER:
+            c = tk.Canvas(sw, width=px(26), height=px(26), bg=P["side"], highlightthickness=0, cursor="hand2"); a = THEMES[name]["accent"]
+            c.create_oval(px(5), px(5), px(21), px(21), fill=a, outline="")
+            if name == cfg["theme"]: c.create_oval(px(2), px(2), px(24), px(24), outline=P["text"], width=2)
+            c.bind("<Button-1>", lambda e, n=name: set_theme(n)); c.pack(side="left", padx=px(2))
+        fr = tk.Frame(foot, bg=P["side"]); fr.pack(fill="x")
+        RBtn(fr, "History", show_hist, icon="history").pack(side="left", padx=(0, px(8))); RBtn(fr, "Settings", settings, icon="sliders").pack(side="left")
+
+        # --- main: sticky action bar ---
+        bar = tk.Frame(mainf, bg=P["side"]); bar.pack(side="bottom", fill="x"); tk.Frame(bar, bg=P["line"], height=1).pack(fill="x")
+        bi = tk.Frame(bar, bg=P["side"]); bi.pack(fill="x", padx=px(26), pady=px(14))
+        W["info"] = tk.Label(bi, text="", bg=P["side"], fg=P["text"], font=F(10, True)); W["info"].pack(side="left")
+        RBtn(bi, "Send", send_queue, h=40, w=130, primary=True, icon="send").pack(side="right")
+
+        # --- main: scrolling content ---
+        sfm = ScrollFrame(mainf); sfm.pack(fill="both", expand=True); body = sfm.inner
+        dz = RCard(body, fill=P["bg"], pad=22, r=18, dash=True); dz.pack(fill="x", padx=px(26), pady=(px(26), px(8))); zi = dz.inner
+        Icon(zi, "upload", 40, P["accent"], P["bg"]).pack()
+        tk.Label(zi, text="Drop files or folders here", bg=P["bg"], fg=P["text"], font=F(15, True)).pack(pady=(px(8), px(2)))
+        tk.Label(zi, text="drag from Explorer, press Ctrl+V to paste, or use the buttons", bg=P["bg"], fg=P["muted"], font=F(10)).pack()
+        zb = tk.Frame(zi, bg=P["bg"]); zb.pack(pady=(px(16), 0))
+        for t, ic, c, pr in (("Files", "file", pick_files, True), ("Folder", "folder", pick_folder, True), ("Paste", "tray", paste, False), ("Text", "text", add_text_dialog, False)):
+            RBtn(zb, t, c, h=40, w=112, primary=pr, icon=ic).pack(side="left", padx=px(5))
+
+        qh = tk.Frame(body, bg=P["bg"]); qh.pack(fill="x", padx=px(26), pady=(px(20), px(6)))
+        tk.Label(qh, text="TO SEND", bg=P["bg"], fg=P["muted"], font=F(9, True)).pack(side="left"); W["qcount"] = tk.Label(qh, text="", bg=P["bg"], fg=P["accent"], font=F(9, True)); W["qcount"].pack(side="left", padx=px(10))
+        RBtn(qh, "Clear all", clear_queue, h=30, icon="close").pack(side="right")
+        W["qbox"] = tk.Frame(body, bg=P["bg"]); W["qbox"].pack(fill="x", padx=px(26))
+        W["qempty"] = tk.Label(W["qbox"], text="Nothing queued. Add files above, then pick a device and press Send.", bg=P["bg"], fg=P["muted"], font=F(10))
+        tk.Label(body, text="Put it into this subfolder on the other device (optional)", bg=P["bg"], fg=P["muted"], font=F(9)).pack(anchor="w", padx=px(28), pady=(px(10), px(4)))
+        W["dest"] = tk.Entry(body, bg=P["card"], fg=P["text"], insertbackground=P["text"], relief="flat", font=F(10)); W["dest"].pack(fill="x", padx=px(26), ipady=px(8))
+
+        xh = tk.Frame(body, bg=P["bg"]); xh.pack(fill="x", padx=px(26), pady=(px(24), px(6)))
+        tk.Label(xh, text="TRANSFERS", bg=P["bg"], fg=P["muted"], font=F(9, True)).pack(side="left"); RBtn(xh, "Cancel all", lambda: [c.cancel.set() for c in active], h=30, icon="close").pack(side="right")
+        W["xbox"] = tk.Frame(body, bg=P["bg"]); W["xbox"].pack(fill="x", padx=px(26), pady=(0, px(26)))
+
+        # --- restore state after a (re)build ---
+        for e in queue_: QueueRow(W["qbox"], e, remove_row).pack(fill="x", pady=px(4))
+        show_devices(dict(devices), keep=True)
+        for c, (ok, msg) in list(done_.items()):   # finished cards stay visible for their 15 s even across a theme change
+            card = make_card(c)
+            if c.names: card.set_files(c.names, c.sizes)
+            paint_done(card, c, ok, msg)
+        for c in list(active):
+            card = make_card(c)
+            if c.names: card.set_files(c.names, c.sizes); card.update_files(c.fdone)
+            if c.last[1]: on_prog(c, *c.last)
+        WIN.style_titlebar(root, P["bg"], P["text"], P["accent"], P["dark"])
+
+    def wheel(e):
+        try: w = root.winfo_containing(e.x_root, e.y_root)
+        except Exception: w = None
+        step = -1 if (getattr(e, "num", 0) == 4 or getattr(e, "delta", 0) > 0) else 1
+        while w is not None:
+            if isinstance(w, ScrollFrame): w.cv.yview_scroll(step * 2, "units"); return
+            w = getattr(w, "master", None)
+    for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"): root.bind_all(ev, wheel)
+    root.bind_all("<Control-v>", lambda e: paste() if not isinstance(e.widget, (tk.Entry, tk.Text)) else None)
+
+    build(); pump(); WIN.hook_dropfiles(root, lambda files: ui(add_paths, files))
+    threading.Thread(target=server, daemon=True).start(); threading.Thread(target=H.discovery_server, args=(cfg,), daemon=True).start()
     refresh(); root.mainloop(); H.save_cfg(cfg)
 
 
