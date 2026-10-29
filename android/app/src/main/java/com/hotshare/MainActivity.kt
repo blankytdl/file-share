@@ -37,8 +37,9 @@ import java.util.Locale
 class MainActivity : Activity(), Core.Ui {
     class QEntry(val kind: String, val name: String, val size: Long, val items: List<Core.Item>) { var view: View? = null }
     class Row(val ic: IconView, val bar: BarView, val st: TextView) { var last = -1; var done = false }
-    class Card(val view: LinearLayout, val title: TextView, val count: TextView, val close: View, val icon: IconView, val bar: BarView, val stat: TextView, val tog: TextView, val box: LinearLayout) {
+    class Card(val view: LinearLayout, val title: TextView, val count: TextView, val close: View, val icon: IconView, val pIcon: IconView, val pBtn: View, val bar: BarView, val stat: TextView, val tog: TextView, val box: LinearLayout) {
         var rows: List<Row> = emptyList(); var open = false; var pulse: ObjectAnimator? = null
+        var state = ""; var jobId = ""; var key = ""; var incoming = false; var parts: List<File> = emptyList()
     }
     companion object { val Q = ArrayList<QEntry>() }   // survives a theme change (activity recreate)
 
@@ -174,7 +175,7 @@ class MainActivity : Activity(), Core.Ui {
 
         // transfers
         val th = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        th.addView(label("Transfers"), LinearLayout.LayoutParams(0, -2, 1f)); th.addView(chip("close", "Cancel all") { Core.cancel() }.apply { setPadding(dp(10), dp(8), dp(10), dp(8)) }); root.addView(th)
+        th.addView(label("Transfers"), LinearLayout.LayoutParams(0, -2, 1f)); th.addView(chip("trash", "Clear cache") { clearCacheUi() }.apply { setPadding(dp(10), dp(8), dp(10), dp(8)) }); th.addView(chip("close", "Cancel all") { Core.cancel() }.apply { setPadding(dp(10), dp(8), dp(10), dp(8)) }); root.addView(th)
         xferBox = col().apply { layoutTransition = LayoutTransition() }; root.addView(xferBox)
         logv = tv("", 12f, C.muted).apply { setPadding(dp(4), dp(14), 0, 0) }; root.addView(logv)
 
@@ -182,12 +183,12 @@ class MainActivity : Activity(), Core.Ui {
         root.addView(label("Theme"))
         val sw = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         C.themes.forEach { t ->
-            val d = dp(36)
+            val d = dp(32)
             sw.addView(FrameLayout(this).apply {
                 background = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(t.accent, t.accent2)).apply { shape = GradientDrawable.OVAL; if (t.name == C.name) setStroke(dp(3), C.text) }
                 if (t.name == C.name) addView(IconView(this@MainActivity, "check", Color.WHITE), FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER))
                 press { if (t.name != C.name) { Core.prefs.edit().putString("theme", t.name).apply(); recreate() } }
-            }, LinearLayout.LayoutParams(d, d).apply { rightMargin = dp(12) })
+            }, LinearLayout.LayoutParams(d, d).apply { rightMargin = dp(10) })
         }
         root.addView(sw)
 
@@ -200,7 +201,7 @@ class MainActivity : Activity(), Core.Ui {
     override fun onStart() {
         super.onStart(); Core.ui = this; subv.text = subtitle(); if (!bgOn()) Core.startServers()
         Core.active.values.forEach { t -> val c = card(t); if (t.names.isNotEmpty()) buildRows(c, t); progress(t) }
-        Core.approvals.values.forEach { approve(it) }
+        buildGhosts(); Core.approvals.values.forEach { approve(it) }
     }
     override fun onStop() { dialogs.values.forEach { it.dismiss() }; dialogs.clear(); Core.ui = null; Core.onUiGone(); if (!bgOn()) Core.stopServers(); super.onStop() }
 
@@ -236,7 +237,7 @@ class MainActivity : Activity(), Core.Ui {
     }
     private fun scan() {
         radar.scanning = true; subv.text = subtitle()
-        Core.daemon { val r = try { Core.scan() } catch (e: Exception) { Core.log("Scan failed: ${e.message}"); emptyList<Dev>() }; runOnUiThread { radar.scanning = false; setDevices(r); if (r.isEmpty()) toast("No devices found. Check both are on the same network and the PC firewall allows HotShare.") } }
+        Core.daemon { val r = try { Core.scan() } catch (e: Exception) { Core.log("Scan failed: ${e.message}"); emptyList<Dev>() }; runOnUiThread { radar.scanning = false; val merged = devs.filter { (it.kind == "IP" || it.kind == "BT") && r.none { x -> x.addr == it.addr } } + r; setDevices(merged, true); if (merged.isEmpty()) toast("No devices found. Check both are on the same network and the PC firewall allows HotShare.") } }
     }
     private fun askIp() {
         val e = EditText(this).apply { hint = "192.168.x.x"; inputType = InputType.TYPE_CLASS_PHONE }
@@ -294,6 +295,8 @@ class MainActivity : Activity(), Core.Ui {
         }
         Core.daemon {
             val es = ArrayList<QEntry>()
+            if (rc == 1) { d.clipData?.let { for (i in 0 until it.itemCount) try { contentResolver.takePersistableUriPermission(it.getItemAt(i).uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {} } ?: d.data?.let { try { contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {} } }
+            if (rc == 2) try { contentResolver.takePersistableUriPermission(d.data!!, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
             if (rc == 1) { val uris = ArrayList<Uri>(); d.clipData?.let { for (i in 0 until it.itemCount) uris.add(it.getItemAt(i).uri) } ?: d.data?.let { uris.add(it) }; uris.forEach { u -> Core.uriItem(u)?.let { x -> es.add(QEntry("file", x.rel, x.size, listOf(x))) } } }
             if (rc == 2) { val t = DocumentFile.fromTreeUri(this, d.data!!)!!; val items = ArrayList<Core.Item>(); Core.walk(t, t.name ?: "folder", items); if (items.isNotEmpty()) es.add(QEntry("folder", t.name ?: "folder", items.sumOf { it.size }, items)) }
             runOnUiThread { if (es.isEmpty()) toast("Nothing to add") else es.forEach { addEntry(it) } }
@@ -330,7 +333,7 @@ class MainActivity : Activity(), Core.Ui {
         dlg().setTitle("Share apps (APK)").setMultiChoiceItems(apps.map { pm.getApplicationLabel(it).toString() }.toTypedArray(), on) { _, i, v -> on[i] = v }
             .setPositiveButton("Add to list") { _, _ ->
                 apps.filterIndexed { i, _ -> on[i] }.forEach { a -> val f = File(a.sourceDir); val nm = pm.getApplicationLabel(a).toString() + ".apk"
-                    addEntry(QEntry("app", nm, f.length(), listOf(Core.Item(nm, f.length(), f.lastModified() / 1000) { FileInputStream(f) }))) }
+                    addEntry(QEntry("app", nm, f.length(), listOf(Core.Item(nm, f.length(), f.lastModified() / 1000, src = "file:" + f.path) { FileInputStream(f) }))) }
             }.show()
     }
 
@@ -342,14 +345,17 @@ class MainActivity : Activity(), Core.Ui {
         val title = tv(if (t.incoming) "From ${t.label}" else t.label, 15f, C.text, true).apply { setPadding(dp(10), 0, 0, 0); maxLines = 1; ellipsize = TextUtils.TruncateAt.END }
         top.addView(title, LinearLayout.LayoutParams(0, -2, 1f))
         val count = tv("", 12f, C.muted).apply { setPadding(dp(8), 0, dp(8), 0) }; top.addView(count)
-        val close = badge("close", 34, Color.TRANSPARENT, C.muted, 8).apply { press { Core.cancel(t.id) } }; top.addView(close)
+        val pIcon = IconView(this, "pause", C.text)
+        val pBtn = FrameLayout(this).apply { layoutParams = LinearLayout.LayoutParams(dp(34), dp(34)); addView(pIcon, FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER)); press { pauseClick(t.id) } }
+        val close = badge("close", 34, Color.TRANSPARENT, C.muted, 8).apply { press { discardCard(t.id) } }
+        top.addView(pBtn); top.addView(close)
         val bar = BarView(this); val stat = tv("Starting...", 12f, C.muted)
         val low = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }; low.addView(stat, LinearLayout.LayoutParams(0, -2, 1f))
         val tog = tv("", 12f, C.accent, true).apply { setPadding(dp(10), dp(6), 0, dp(6)) }; low.addView(tog)
         val box = col().apply { visibility = View.GONE; setPadding(0, dp(8), 0, 0) }
         v.addView(top); v.addView(bar, lp(h = dp(8), top = 12)); v.addView(low, lp(top = 8)); v.addView(box)
         xferBox.addView(v, lp(top = 8))
-        val c = Card(v, title, count, close, icon, bar, stat, tog, box)
+        val c = Card(v, title, count, close, icon, pIcon, pBtn, bar, stat, tog, box); c.incoming = t.incoming; c.jobId = t.jobId; c.key = t.key
         c.pulse = ObjectAnimator.ofFloat(icon, "alpha", 1f, .35f).apply { duration = 800; repeatCount = ValueAnimator.INFINITE; repeatMode = ValueAnimator.REVERSE; start() }
         tog.press { c.open = !c.open; showRows(c) }
         c
@@ -377,6 +383,34 @@ class MainActivity : Activity(), Core.Ui {
             else { r.bar.set(if (sz > 0) d.toFloat() / sz else 0f); r.st.text = if (sz > 0) "$key%" else ""; r.st.setTextColor(C.muted) }
         }
     }
+    private fun pauseClick(id: Int) {
+        val c = cards[id] ?: return
+        if (c.state == "paused") {            // Resume
+            removeCard(id)
+            if (c.incoming) { Core.resumeIncoming(c.key); toast("Resumed - the sender reconnects in a moment") }
+            else if (!Core.resumeJob(c.jobId)) toast("Could not resume - the files are no longer available")
+        } else if (c.state == "") { Core.pause(id); c.stat.text = "Pausing..."; c.stat.setTextColor(C.warn) }
+    }
+    private fun discardCard(id: Int) {        // X: stop a running transfer and discard its cached data, or dismiss a finished / paused card
+        val c = cards[id] ?: return
+        if (c.state == "") { Core.cancel(id); return }
+        if (c.jobId.isNotEmpty()) Core.discardJob(c.jobId)
+        if (c.incoming) { Core.resumeIncoming(c.key); c.parts.forEach { it.delete() } }
+        removeCard(id)
+    }
+    private fun clearCacheUi() {
+        val n = Core.clearCache()
+        if (n < 0) { toast("Finish or cancel the running transfers first"); return }
+        cards.filter { it.value.state == "paused" }.keys.toList().forEach { removeCard(it) }
+        toast("Cleared ${size(n)} of cached data and the interrupted-transfer list")
+    }
+    private fun buildGhosts() {               // transfers interrupted by a restart / power cut, shown paused with a Resume button
+        for (j in Core.pendingJobs()) {
+            if (cards.values.any { it.jobId == j.id }) continue
+            val g = Core.Transfer(-(Math.abs(j.id.hashCode()) + 1), "To ${j.name}", false); g.names = j.names.toTypedArray(); g.sizes = j.sizes.toLongArray(); g.fdone = LongArray(j.names.size); g.jobId = j.id
+            val c = card(g); buildRows(c, g); finished(g, "paused", "interrupted earlier - press Resume to continue")
+        }
+    }
     private fun removeCard(id: Int) { cards.remove(id)?.let { it.pulse?.cancel(); xferBox.removeView(it.view) } }
 
     // ---------- Core.Ui (called from background threads) ----------
@@ -384,13 +418,20 @@ class MainActivity : Activity(), Core.Ui {
     override fun files(t: Core.Transfer) = runOnUiThread { val c = card(t); buildRows(c, t) }
     override fun started(t: Core.Transfer) = runOnUiThread { card(t); Unit }
     override fun progress(t: Core.Transfer) = runOnUiThread {
-        val c = card(t); c.bar.set(if (t.total > 0) t.done.toFloat() / t.total else 0f)
+        val c = card(t); c.jobId = t.jobId; c.key = t.key; c.parts = t.parts; c.bar.set(if (t.total > 0) t.done.toFloat() / t.total else 0f)
         c.stat.text = "${size(t.done)} of ${size(t.total)}   -   %.1f MB/s   -   ${t.eta}s left".format(t.speed / 1048576); updateRows(c, t, false)
     }
-    override fun finished(t: Core.Transfer, ok: Boolean, msg: String) = runOnUiThread {
-        val c = card(t); c.pulse?.cancel(); c.icon.alpha = 1f; c.bar.set(if (ok) 1f else c.bar.cur, ok); updateRows(c, t, ok)
-        c.stat.text = (if (ok) "Done - " else "Stopped - ") + msg; c.stat.setTextColor(if (ok) C.ok else C.err)
-        c.close.press { removeCard(t.id) }; c.view.postDelayed({ removeCard(t.id) }, 15000)
+    override fun state(t: Core.Transfer, s: String, msg: String) = runOnUiThread {
+        val c = card(t); c.jobId = t.jobId; c.key = t.key
+        when (s) { "reconnecting", "waiting" -> { c.stat.text = msg; c.stat.setTextColor(C.warn) }; "connecting" -> { c.stat.text = msg; c.stat.setTextColor(C.muted) }; else -> {} }
+    }
+    override fun finished(t: Core.Transfer, state: String, msg: String) = runOnUiThread {
+        val c = card(t); c.jobId = t.jobId; c.key = t.key; c.incoming = t.incoming; c.parts = t.parts; c.state = state; c.pulse?.cancel(); c.icon.alpha = 1f
+        val ok = state == "ok"; c.bar.set(if (ok) 1f else c.bar.cur, ok); updateRows(c, t, ok)
+        c.stat.text = (if (ok) "Done - " else if (state == "paused") "Paused - " else if (state == "cancelled") "Cancelled - " else "Stopped - ") + msg
+        c.stat.setTextColor(if (ok) C.ok else if (state == "paused") C.warn else C.err)
+        if (state == "paused") c.pIcon.setIcon("play", C.ok) else c.pBtn.visibility = View.GONE
+        if (state != "paused") c.view.postDelayed({ removeCard(t.id) }, 15000)
     }
     override fun approve(a: Core.Approval) = runOnUiThread {
         if (isFinishing || isDestroyed) return@runOnUiThread
@@ -416,13 +457,17 @@ class MainActivity : Activity(), Core.Ui {
         fun field(h: String, k: String, d: String, num: Boolean = false) = EditText(this).apply { hint = h; setText(Core.cfg(k, d)); if (num) inputType = InputType.TYPE_CLASS_NUMBER; l.addView(this) }
         fun sw(t: String, k: String, d: Boolean) = Switch(this).apply { text = t; isChecked = p.getBoolean(k, d); setPadding(0, dp(10), 0, dp(10)); l.addView(this) }
         val name = field("Device name", "name", Build.MODEL); val pin = field("Shared PIN (same on both devices)", "pin", ""); val port = field("Port", "port", "45455", true)
+        val rec = field("Keep reconnecting for (seconds)", "reconnect_s", "300", true); val idle = field("Quit when idle, in minutes (0 = never)", "idle_min", "3", true)
         val auto = sw("Auto-accept everything", "auto", false); val vis = sw("Visible to nearby devices", "visible", true); val bg = sw("Receive in background", "bg", true)
         l.addView(tv("Receiving into: " + savePathText(), 14f, C.muted).apply { setPadding(0, dp(12), 0, dp(4)) })
         l.addView(Button(this).apply { text = "Reset to default folder"; setOnClickListener { p.edit().remove("tree").apply(); savePath.text = savePathText(); text = "Reset" } })
         l.addView(Button(this).apply { text = "Clear trusted devices (${Core.trusted().size})"; setOnClickListener { p.edit().remove("trusted").apply(); text = "Cleared" } })
+        l.addView(Button(this).apply { text = "Clear transfer cache (${size(Core.cacheBytes())})"; setOnClickListener { clearCacheUi(); text = "Cache now: ${size(Core.cacheBytes())}" } })
         dlg().setTitle("Settings").setView(ScrollView(this).apply { addView(l) }).setPositiveButton("Save") { _, _ ->
             val portChanged = port.text.toString() != Core.cfg("port", "45455")
-            p.edit().putString("name", name.text.toString()).putString("pin", pin.text.toString()).putString("port", port.text.toString().ifEmpty { "45455" }).putBoolean("auto", auto.isChecked).putBoolean("visible", vis.isChecked).putBoolean("bg", bg.isChecked).apply()
+            p.edit().putString("name", name.text.toString()).putString("pin", pin.text.toString()).putString("port", port.text.toString().ifEmpty { "45455" })
+                .putString("reconnect_s", rec.text.toString().ifEmpty { "300" }).putString("idle_min", idle.text.toString().ifEmpty { "3" })
+                .putBoolean("auto", auto.isChecked).putBoolean("visible", vis.isChecked).putBoolean("bg", bg.isChecked).apply()
             subv.text = subtitle()
             if (bg.isChecked) startForegroundService(Intent(this, ReceiverService::class.java)) else stopService(Intent(this, ReceiverService::class.java))
             if (portChanged) Core.daemon { Core.restartServers() }

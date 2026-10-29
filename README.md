@@ -29,6 +29,20 @@ On the PC you can also pick a different folder for one transfer in the Accept di
   a title bar coloured to match the theme (Windows 10/11).
 - **Android:** the same send list, Paste button, per-file progress and themes; Send bar stays on screen.
 
+## Reliability: pause, resume, power cuts, cache
+- **Pause / Resume** on every transfer card (play/pause button). Pausing keeps the partial data; Resume continues from the exact byte.
+  The receiver can pause too: the sender then waits and carries on by itself when the receiver resumes.
+- **Dropped connection / sleeping phone / Wi-Fi hiccup:** both apps reconnect automatically for 5 minutes (Settings > "Keep reconnecting for")
+  and continue where they stopped. A transfer you already accepted is never asked about again on reconnect.
+- **Power cut or crash:** unfinished sends are saved. On the next start they appear as **paused** cards with a Resume button.
+  Android can resume files you picked with the file chooser or the folder chooser, and apps; things pasted from other apps cannot be reopened after a restart.
+- **X** on a running transfer stops it and erases its cached data. **Cache** (partial files of unfinished transfers) is erased automatically
+  as soon as a transfer succeeds, and also with the **Clear cache** button (Transfers header and Settings).
+- **Android quits by itself:** with the app closed and nothing transferring, the background service stops after "Quit when idle" minutes
+  (default 3; 0 = never) and the app exits. Open it again to receive.
+- Faster: large network buffers, disk + hashing overlapped with sending on the PC, Wi-Fi high-performance lock on Android, light animations while a transfer runs.
+- Files named with characters Windows refuses (`: ? " < > |`) are saved with `_` instead of failing; Windows antivirus locks no longer fail a finished file.
+
 ## If "Scan" finds nothing
 1. Both devices on the same hotspot / Wi-Fi (or USB tether).
 2. **Windows Firewall:** the first time HotShare.exe runs, allow it on *Private* networks (UDP 45454 + TCP 45455). If you clicked Cancel, re-allow it in

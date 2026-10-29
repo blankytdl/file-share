@@ -21,6 +21,9 @@ object Icons {
         "download" to arrayOf(Prim(0, floatArrayOf(12f, 4f, 12f, 16f)), Prim(0, floatArrayOf(6f, 11f, 12f, 17f, 18f, 11f)), Prim(0, floatArrayOf(5f, 20f, 19f, 20f))),
         "upload" to arrayOf(Prim(0, floatArrayOf(12f, 20f, 12f, 8f)), Prim(0, floatArrayOf(6f, 13f, 12f, 7f, 18f, 13f)), Prim(0, floatArrayOf(5f, 4f, 19f, 4f))),
         "send" to arrayOf(Prim(0, floatArrayOf(4f, 12f, 20f, 12f)), Prim(0, floatArrayOf(14f, 6f, 20f, 12f, 14f, 18f))),
+        "pause" to arrayOf(Prim(0, floatArrayOf(9f, 5f, 9f, 19f)), Prim(0, floatArrayOf(15f, 5f, 15f, 19f))),
+        "play" to arrayOf(Prim(1, floatArrayOf(8f, 5f, 19f, 12f, 8f, 19f))),
+        "trash" to arrayOf(Prim(0, floatArrayOf(4f, 7f, 20f, 7f)), Prim(1, floatArrayOf(6f, 7f, 7f, 20f, 17f, 20f, 18f, 7f)), Prim(0, floatArrayOf(10f, 4f, 14f, 4f)), Prim(0, floatArrayOf(10f, 11f, 10f, 16f)), Prim(0, floatArrayOf(14f, 11f, 14f, 16f))),
         "exchange" to arrayOf(Prim(0, floatArrayOf(4f, 8f, 19f, 8f)), Prim(0, floatArrayOf(15f, 4f, 19f, 8f, 15f, 12f)), Prim(0, floatArrayOf(20f, 16f, 5f, 16f)), Prim(0, floatArrayOf(9f, 12f, 5f, 16f, 9f, 20f))),
     )
 }

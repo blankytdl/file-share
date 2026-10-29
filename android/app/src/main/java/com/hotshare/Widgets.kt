@@ -28,14 +28,14 @@ object C {
         return if (dark) Theme(name, true, bg, mix(bg, w, .075f), mix(bg, w, .15f), mix(mix(bg, w, .075f), a1, .2f), rgb(0xE8EDF5), rgb(0x8D99AB), a1, a2, rgb(0x38D39F), rgb(0xFF6B6B), mix(bg, w, .17f))
         else Theme(name, false, bg, w, mix(bg, k, .07f), mix(w, a1, .14f), rgb(0x1B2430), rgb(0x66728A), a1, a2, rgb(0x12A37A), rgb(0xD94646), mix(bg, k, .11f))
     }
-    val themes: List<Theme> = listOf(mk("Midnight", true, 0x0F1419, 0x4C8DFF, 0x7C5CFF), mk("Ocean", true, 0x0A1620, 0x22D3EE, 0x3B82F6), mk("Emerald", true, 0x0C1713, 0x34D399, 0x22C55E),
+    val themes: List<Theme> = listOf(mk("Midnight", true, 0x0F1419, 0x4C8DFF, 0x7C5CFF), mk("Crimson", true, 0x150B0D, 0xFF4D5E, 0xFF7A45), mk("Ocean", true, 0x0A1620, 0x22D3EE, 0x3B82F6), mk("Emerald", true, 0x0C1713, 0x34D399, 0x22C55E),
         mk("Sunset", true, 0x181110, 0xFB923C, 0xF43F5E), mk("Orchid", true, 0x130F1D, 0xC084FC, 0xEC4899), mk("Daylight", false, 0xEEF2F8, 0x2F6DF0, 0x6A4CE0))
     var name = "Midnight"; var dark = true
-    var bg = 0; var card = 0; var card2 = 0; var sel = 0; var text = 0; var muted = 0; var accent = 0; var accent2 = 0; var ok = 0; var err = 0; var track = 0
+    var bg = 0; var card = 0; var card2 = 0; var sel = 0; var text = 0; var muted = 0; var accent = 0; var accent2 = 0; var ok = 0; var err = 0; var track = 0; var warn = 0
     init { apply("Midnight") }
     fun apply(n: String) {
         val t = themes.firstOrNull { it.name == n } ?: themes[0]
-        name = t.name; dark = t.dark; bg = t.bg; card = t.card; card2 = t.card2; sel = t.sel; text = t.text; muted = t.muted; accent = t.accent; accent2 = t.accent2; ok = t.ok; err = t.err; track = t.track
+        name = t.name; dark = t.dark; bg = t.bg; card = t.card; card2 = t.card2; sel = t.sel; text = t.text; muted = t.muted; accent = t.accent; accent2 = t.accent2; ok = t.ok; err = t.err; track = t.track; warn = rgb(if (t.dark) 0xF5B84B else 0xB97800)
     }
 }
 
@@ -100,8 +100,9 @@ class BarView(c: Context) : View(c) {
 }
 
 /** Crisp vector icon from the shared icon set (no emoji/fonts, so it never renders as a broken box). */
-class IconView(c: Context, private val name: String, private var color: Int = C.text) : View(c) {
+class IconView(c: Context, private var name: String, private var color: Int = C.text) : View(c) {
     fun setIconColor(c: Int) { color = c; invalidate() }
+    fun setIcon(n: String, col: Int) { name = n; color = col; invalidate() }
     private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
 
     override fun onDraw(c: Canvas) {

@@ -15,16 +15,16 @@ def lerp(a, b, t):
 
 def _mk(bg, a1, a2, dark=True):
     if dark:
-        t = dict(dark=True, bg=bg, side=lerp(bg, "#ffffff", .03), card=lerp(bg, "#ffffff", .075), card2=lerp(bg, "#ffffff", .15), track=lerp(bg, "#ffffff", .17), text="#e8edf5", muted="#8d99ab", ok="#38d39f", err="#ff6b6b")
+        t = dict(dark=True, bg=bg, side=lerp(bg, "#ffffff", .03), card=lerp(bg, "#ffffff", .075), card2=lerp(bg, "#ffffff", .15), track=lerp(bg, "#ffffff", .17), text="#e8edf5", muted="#8d99ab", ok="#38d39f", err="#ff6b6b", warn="#f5b84b")
     else:
-        t = dict(dark=False, bg=bg, side=lerp(bg, "#000000", .035), card="#ffffff", card2=lerp(bg, "#000000", .07), track=lerp(bg, "#000000", .11), text="#1b2430", muted="#66728a", ok="#12a37a", err="#d94646")
+        t = dict(dark=False, bg=bg, side=lerp(bg, "#000000", .035), card="#ffffff", card2=lerp(bg, "#000000", .07), track=lerp(bg, "#000000", .11), text="#1b2430", muted="#66728a", ok="#12a37a", err="#d94646", warn="#b97800")
     t.update(accent=a1, accent2=a2, hover=lerp(t["card"], a1, .12), line=lerp(bg, t["text"], .12)); return t
 
 
-THEME_ORDER = ["Midnight", "Ocean", "Emerald", "Sunset", "Orchid", "Daylight"]
-THEMES = {"Midnight": _mk("#0f1419", "#4c8dff", "#7c5cff"), "Ocean": _mk("#0a1620", "#22d3ee", "#3b82f6"), "Emerald": _mk("#0c1713", "#34d399", "#22c55e"),
+THEME_ORDER = ["Midnight", "Crimson", "Ocean", "Emerald", "Sunset", "Orchid", "Daylight"]
+THEMES = {"Midnight": _mk("#0f1419", "#4c8dff", "#7c5cff"), "Crimson": _mk("#150b0d", "#ff4d5e", "#ff7a45"), "Ocean": _mk("#0a1620", "#22d3ee", "#3b82f6"), "Emerald": _mk("#0c1713", "#34d399", "#22c55e"),
           "Sunset": _mk("#181110", "#fb923c", "#f43f5e"), "Orchid": _mk("#130f1d", "#c084fc", "#ec4899"), "Daylight": _mk("#eef2f8", "#2f6df0", "#6a4ce0", False)}
-P, SC, FONT = {}, [1.0], ["Segoe UI"]
+P, SC, FONT, BUSY = {}, [1.0], ["Segoe UI"], [False]   # BUSY: a transfer is running -> keep animations light so they never compete with it
 
 
 def apply_theme(name): P.clear(); P.update(THEMES.get(name, THEMES["Midnight"]))
@@ -95,7 +95,7 @@ class Bar(tk.Canvas):
         s.cur += (s.tgt - s.cur) * .25; s.ph = (s.ph + .035) % 1
         if abs(s.tgt - s.cur) < .002: s.cur = s.tgt
         s.draw()
-        if abs(s.tgt - s.cur) > 0 or (s.shine and not s.done and 0 < s.cur < 1): s.after(33, s.step)
+        if abs(s.tgt - s.cur) > 0 or (s.shine and not s.done and 0 < s.cur < 1): s.after(60 if BUSY[0] else 33, s.step)
         else: s.run = False
 
     def draw(s):
@@ -150,7 +150,8 @@ class RCard(tk.Canvas):
 
     def march(s):   # marching-ants border
         if not s.winfo_exists(): return
-        s.ph = (s.ph + 1) % 12; s.itemconfigure("bg", dashoffset=s.ph); s.after(80, s.march)
+        if not BUSY[0]: s.ph = (s.ph + 1) % 12; s.itemconfigure("bg", dashoffset=s.ph)
+        s.after(120, s.march)
 
     def paint(s, fill, edge=None):
         old = s.fill; s.fill, s.edge = fill, edge; s.inner.configure(bg=fill)
@@ -219,18 +220,26 @@ class QueueRow(RCard):
 class XCard(RCard):
     MAXROWS = 40
 
-    def __init__(s, parent, title, up, on_cancel):
-        super().__init__(parent, pad=14); i = s.inner; s.rows, s.sizes, s.open, s.cancel_cb = [], [], False, on_cancel
+    def __init__(s, parent, title, up, on_cancel, on_pause):
+        super().__init__(parent, pad=14); i = s.inner; s.rows, s.sizes, s.open, s.cancel_cb, s.pause_cb, s.mode = [], [], False, on_cancel, on_pause, "run"
         top = tk.Frame(i, bg=P["card"]); top.pack(fill="x")
         Icon(top, "upload" if up else "download", 22, P["accent"], P["card"]).pack(side="left")
         s.title = tk.Label(top, text=title, bg=P["card"], fg=P["text"], font=F(11, True)); s.title.pack(side="left", padx=(px(10), 0))
         s.count = tk.Label(top, text="", bg=P["card"], fg=P["muted"], font=F(9)); s.count.pack(side="left", padx=(px(10), 0))
         x = Icon(top, "close", 18, P["muted"], P["card"]); x.pack(side="right"); x.configure(cursor="hand2"); x.bind("<Button-1>", lambda e: s.cancel_cb())
+        s.pbtn = Icon(top, "pause", 18, P["text"], P["card"]); s.pbtn.pack(side="right", padx=(0, px(12))); s.pbtn.configure(cursor="hand2"); s.pbtn.bind("<Button-1>", lambda e: s.pause_cb())
         s.bar = Bar(i, h=10, shine=True); s.bar.pack(fill="x", pady=(px(12), px(6)))
         low = tk.Frame(i, bg=P["card"]); low.pack(fill="x")
         s.stat = tk.Label(low, text="Starting...", bg=P["card"], fg=P["muted"], font=F(9), anchor="w"); s.stat.pack(side="left")
         s.tog = tk.Label(low, text="", bg=P["card"], fg=P["accent"], font=F(9, True), cursor="hand2"); s.tog.pack(side="right"); s.tog.bind("<Button-1>", lambda e: s.toggle())
         s.fbox = tk.Frame(i, bg=P["card"]); fade_in(s)
+
+    def set_mode(s, mode):
+        if mode == s.mode: return
+        s.mode = mode
+        if mode == "done": s.pbtn.pack_forget(); return
+        s.pbtn.pack(side="right", padx=(0, px(12)))
+        s.pbtn.show("play", P["ok"]) if mode == "paused" else s.pbtn.show("pause", P["text"])
 
     def set_files(s, names, sizes):
         for w in s.fbox.winfo_children(): w.destroy()
@@ -373,33 +382,93 @@ def main():
 
     # ------------------------------ transfers ------------------------------
     def title_of(c): return ("From " if c.incoming and c.label != "Incoming" else "") + c.label
+
     def make_card(c):
-        card = XCard(W["xbox"], title_of(c), not c.incoming, c.cancel.set); card.pack(fill="x", pady=px(6)); cards[c] = card; return card
+        card = XCard(W["xbox"], title_of(c), not c.incoming, lambda: discard(c), lambda: toggle_pause(c)); card.pack(fill="x", pady=px(6)); cards[c] = card; return card
+
+    def update_speed():
+        if W.get("speed") is not None and W["speed"].winfo_exists():
+            W["speed"].configure(text=f"{H.hsize(sum(c.last[2] for c in active if c.state not in ('waiting', 'reconnecting')))}/s   -   {len(active)} active" if active else "Idle")
 
     def on_files(c):
         card = cards.get(c) or make_card(c); card.title.configure(text=title_of(c)); card.set_files(c.names, c.sizes)
 
     def on_prog(c, d, t, sp, eta):
         card = cards.get(c) or make_card(c); card.title.configure(text=title_of(c)); card.bar.set(d / t if t else 0)
-        card.stat.configure(text=f"{H.hsize(d)} of {H.hsize(t)}   -   {H.hsize(sp)}/s   -   {int(eta)}s left" if sp else "Finishing...", fg=P["muted"]); card.update_files(c.fdone)
+        card.stat.configure(text=f"{H.hsize(d)} of {H.hsize(t)}   -   {H.hsize(sp)}/s   -   {int(eta)}s left" if sp else "Finishing...", fg=P["muted"]); card.update_files(c.fdone); update_speed()
+
+    def on_state(c, st, msg):
+        card = cards.get(c) or make_card(c)
+        if st in ("reconnecting", "waiting"): card.stat.configure(text=msg, fg=P["warn"])
+        elif st == "connecting": card.stat.configure(text=msg, fg=P["muted"])
 
     def remove_card(c):
         card = cards.pop(c, None); done_.pop(c, None)
         if card is not None and card.winfo_exists(): card.destroy()
 
-    def paint_done(card, c, ok, msg):
-        card.title.configure(text=title_of(c)); card.bar.set(1 if ok else card.bar.cur, done=ok); card.update_files(c.fdone, all_done=ok)
-        card.stat.configure(text=("Done - " if ok else "Stopped - ") + msg, fg=P["ok"] if ok else P["err"]); card.cancel_cb = lambda: remove_card(c)
+    def paint_done(card, c, state, msg):
+        ok = state == "ok"; card.title.configure(text=title_of(c)); card.bar.set(1 if ok else card.bar.cur, done=ok); card.update_files(c.fdone, all_done=ok)
+        word = {"ok": "Done - ", "paused": "Paused - ", "cancelled": "Cancelled - "}.get(state, "Stopped - ")
+        card.stat.configure(text=word + msg, fg=P["ok"] if ok else (P["warn"] if state == "paused" else P["err"])); card.set_mode("paused" if state == "paused" else "done")
 
-    def finish(c, ok, msg):
-        card = cards.get(c) or make_card(c); done_[c] = (ok, msg); paint_done(card, c, ok, msg); root.after(15000, remove_card, c)
-        if ok and c.got and cfg["open_after"] and c.incoming: open_inbox()
+    def finish(c, state, msg):
+        card = cards.get(c) or make_card(c); done_[c] = (state, msg); paint_done(card, c, state, msg); update_speed()
+        if state != "paused": root.after(15000, remove_card, c)
+        if state == "ok" and c.got and cfg["open_after"] and c.incoming: open_inbox()
 
     def hist(d, name, size, peer):
         cfg["history"] = (cfg["history"] + [[time.strftime("%Y-%m-%d %H:%M"), d, name, size, peer]])[-200:]
 
     def new_ctl(label, incoming):
-        c = H.Ctl(cfg, ask, lambda *a: ui(on_prog, c, *a), log, on_text, hist); c.label, c.incoming = label, incoming; c.on_files = lambda: ui(on_files, c); active.append(c); return c
+        c = H.Ctl(cfg, ask, lambda *a: ui(on_prog, c, *a), log, on_text, hist); c.label, c.incoming = label, incoming
+        c.on_files = lambda: ui(on_files, c); c.on_state = lambda st, m: ui(on_state, c, st, m); active.append(c); BUSY[0] = True; return c
+
+    def toggle_pause(c):
+        state = done_.get(c, (None,))[0]
+        if state == "paused": return resume(c)
+        if state is not None: return
+        if c.incoming and c.key: H.PAUSED.add(c.key)      # the sender will wait until we resume
+        c.pause.set(); card = cards.get(c)
+        if card: card.stat.configure(text="Pausing...", fg=P["warn"])
+
+    def resume(c):
+        if c.incoming: H.PAUSED.discard(c.key); remove_card(c); toast("Resumed - the sender reconnects in a moment")
+        elif c.job: job = c.job; remove_card(c); start_job(job)
+
+    def discard(c):   # the X button: stop and throw the transfer (and its cached partial data) away
+        state = done_.get(c, (None,))[0]
+        if state is None: c.discard = True; c.cancel.set(); return
+        if c.job: H.drop_job(c.job["id"])
+        if c.incoming:
+            H.PAUSED.discard(c.key)
+            for p in c.parts: H._rm(p)
+        remove_card(c)
+
+    def start_job(job):
+        ctl = new_ctl("To " + job["name"], False); ctl.job = job; H.save_job(job)    # saved first: survives a crash / power cut
+        def w():
+            try: H.send(job["host"], job["port"], job["items"], ctl, job["dest"]); H.drop_job(job["id"]); ui(finish, ctl, "ok", "sent")
+            except InterruptedError: H.drop_job(job["id"]); ui(finish, ctl, "cancelled", "cancelled; cached data discarded")
+            except H.Paused: ui(finish, ctl, "paused", "press Resume to continue")
+            except H.ConnectionLost as e: ui(finish, ctl, "paused", f"{e}. Press Resume when the other device is back")
+            except PermissionError as e: H.drop_job(job["id"]); ui(finish, ctl, "fail", str(e))
+            except Exception as e: ui(finish, ctl, "paused", f"{e} - press Resume to retry")
+            finally: active.remove(ctl); BUSY[0] = bool(active); H.save_cfg(cfg); ui(update_speed)
+        threading.Thread(target=w, daemon=True).start()
+
+    def restore_jobs():   # transfers interrupted by a crash / power cut / closing the app
+        for job in H.load_jobs():
+            job["items"] = [it for it in job["items"] if it["t"] == "text" or os.path.exists(H.lp(it.get("abs", "")))]
+            if not job["items"]: H.drop_job(job["id"]); continue
+            c = H.Ctl(cfg); c.label, c.incoming, c.job = "To " + job["name"], False, job
+            c.names = ["Text message" if it["t"] == "text" else it["rel"] for it in job["items"]]; c.sizes = [it["size"] for it in job["items"]]; c.fdone = [0] * len(c.names)
+            card = make_card(c); card.set_files(c.names, c.sizes); done_[c] = ("paused", "interrupted earlier - press Resume to continue"); paint_done(card, c, *done_[c])
+
+    def clear_cache_ui():
+        if active: return toast("Finish or cancel the running transfers first")
+        freed = H.clear_cache(cfg["folder"])
+        for c in [c for c, (st, m) in done_.items() if st == "paused"]: remove_card(c)
+        toast(f"Cleared {H.hsize(freed)} of cached partial data and the interrupted-transfer list")
 
     def on_text(peer, txt):
         def f():
@@ -428,7 +497,8 @@ def main():
         return (out[0] if out else None), folder[0]
 
     def server():
-        try: s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("", cfg["port"])); s.listen(32)
+        try:
+            s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20); s.bind(("", cfg["port"])); s.listen(32)
         except Exception as e: return ui(toast, f"Cannot receive: {e} (is the port already in use?)")
         while True:
             c, _ = s.accept()
@@ -436,13 +506,16 @@ def main():
                 ctl = new_ctl("Incoming", True)
                 try:
                     H.handle(c, ctl)
-                    if ctl.label != "Incoming": ui(finish, ctl, not ctl.declined, "Declined" if ctl.declined else (f"received {ctl.got} file(s)" if ctl.got else "text received"))
+                    if not ctl.silent and ctl.label != "Incoming":
+                        ui(finish, ctl, "fail" if ctl.declined else "ok", "Declined" if ctl.declined else (f"received {ctl.got} file(s)" if ctl.got else "text received"))
+                except H.Paused: ui(finish, ctl, "paused", "partial data kept. Press Resume and the sender continues")
+                except InterruptedError: ui(finish, ctl, "cancelled", "cancelled; cached data discarded")
                 except Exception as e:
-                    if ctl.label != "Incoming": ui(finish, ctl, False, f"{e} (partial kept, will resume)")
+                    if ctl.label != "Incoming" and not ctl.silent: ui(finish, ctl, "fail", f"{e} - partial data kept, the sender reconnects on its own")
                 finally:
                     try: c.close()
                     except OSError: pass
-                    active.remove(ctl); H.save_cfg(cfg)
+                    active.remove(ctl); BUSY[0] = bool(active); H.save_cfg(cfg); ui(update_speed)
             threading.Thread(target=run, daemon=True).start()
 
     def send_queue():
@@ -450,21 +523,16 @@ def main():
         if not queue_: return toast("Add files, a folder or text first")
         if not t: return toast("Select a device on the left first")
         items = [it for e in queue_ for it in e["items"]]; dest = W["dest"].get().strip()
-        for ip, port, name in t:
-            def w(ip=ip, port=port, name=name):
-                ctl = new_ctl("To " + name, False)
-                try: H.send(ip, port, items, ctl, dest); ui(finish, ctl, True, "sent")
-                except InterruptedError: ui(finish, ctl, False, "cancelled")
-                except Exception as e: ui(finish, ctl, False, str(e))
-                finally: active.remove(ctl); H.save_cfg(cfg)
-            threading.Thread(target=w, daemon=True).start()
+        for ip, port, name in t: start_job(H.new_job(ip, port, name, [dict(it) for it in items], dest))
         clear_queue()
 
     # ------------------------------ devices ------------------------------
     def refresh():
         W["radar"].start()
+        def after_scan(r):   # merge: devices added by hand (Add IP) and the current selection survive a scan
+            m = {k: v for k, v in devices.items() if v[2] == "IP"}; m.update(r); show_devices(m, keep=True)
         def w():
-            r = H.scan(port=cfg["port"]); ui(show_devices, r)
+            r = H.scan(port=cfg["port"]); ui(after_scan, r)
         threading.Thread(target=w, daemon=True).start()
 
     def show_devices(r, keep=False):
@@ -510,20 +578,22 @@ def main():
 
     def settings():
         w = dialog("Settings")
-        v = {k: tk.StringVar(value=str(cfg[k])) for k in ("name", "folder", "port", "pin", "retries")}; b = {k: tk.BooleanVar(value=cfg[k]) for k in ("auto", "visible", "open_after")}
-        for i, (k, l) in enumerate((("name", "Device name"), ("folder", "Save folder"), ("port", "Port"), ("pin", "Shared PIN"), ("retries", "Auto-resume attempts"))):
+        v = {k: tk.StringVar(value=str(cfg[k])) for k in ("name", "folder", "port", "pin", "reconnect_s")}; b = {k: tk.BooleanVar(value=cfg[k]) for k in ("auto", "visible", "open_after")}
+        for i, (k, l) in enumerate((("name", "Device name"), ("folder", "Save folder"), ("port", "Port"), ("pin", "Shared PIN"), ("reconnect_s", "Keep reconnecting for (seconds)"))):
             label(w, l).grid(row=i, column=0, sticky="w", padx=px(22), pady=px(7))
             tk.Entry(w, textvariable=v[k], width=34, bg=P["card2"], fg=P["text"], insertbackground=P["text"], relief="flat", font=F(10)).grid(row=i, column=1, padx=px(6), ipady=px(5))
         RBtn(w, "Browse", lambda: v["folder"].set(filedialog.askdirectory(parent=w) or v["folder"].get()), h=30, icon="folder").grid(row=1, column=2, padx=px(10))
         for j, (k, l) in enumerate((("visible", "Visible to nearby devices"), ("auto", "Auto-accept everything"), ("open_after", "Open folder after receiving"))):
             tk.Checkbutton(w, text=l, variable=b[k], bg=P["bg"], fg=P["text"], selectcolor=P["card"], activebackground=P["bg"], activeforeground=P["text"], font=F(10)).grid(row=5 + j, column=1, sticky="w", pady=px(2))
         RBtn(w, f"Clear trusted devices ({len(cfg['trusted'])})", lambda: (cfg["trusted"].clear(), H.save_cfg(cfg)), h=30).grid(row=8, column=1, sticky="w", pady=px(8))
+        cl = label(w, f"Transfer cache: {H.hsize(H.cache_size(cfg['folder']))}"); cl.grid(row=9, column=0, sticky="w", padx=px(22), pady=px(8))
+        RBtn(w, "Clear cache", lambda: (clear_cache_ui(), cl.configure(text=f"Transfer cache: {H.hsize(H.cache_size(cfg['folder']))}")), h=30, icon="trash").grid(row=9, column=1, sticky="w")
         def ok():
-            try: port, ret = int(v["port"].get()), int(v["retries"].get())
-            except ValueError: return toast("Port and attempts must be numbers")
-            cfg.update(name=v["name"].get(), folder=v["folder"].get(), port=port, pin=v["pin"].get(), retries=ret, **{k: b[k].get() for k in b})
+            try: port, rs = int(v["port"].get()), int(v["reconnect_s"].get())
+            except ValueError: return toast("Port and reconnect time must be numbers")
+            cfg.update(name=v["name"].get(), folder=v["folder"].get(), port=port, pin=v["pin"].get(), reconnect_s=max(10, rs), **{k: b[k].get() for k in b})
             os.makedirs(cfg["folder"], exist_ok=True); H.save_cfg(cfg); W["path"].configure(text=short(cfg["folder"], 30)); w.destroy(); toast("Saved (restart to apply a new port)")
-        RBtn(w, "Save", ok, primary=True, icon="check").grid(row=9, column=1, pady=px(16), sticky="w")
+        RBtn(w, "Save", ok, primary=True, icon="check").grid(row=10, column=1, pady=px(16), sticky="w")
 
     def set_theme(name):
         if name == cfg["theme"]: return
@@ -581,6 +651,12 @@ def main():
         W["info"] = tk.Label(bi, text="", bg=P["side"], fg=P["text"], font=F(10, True)); W["info"].pack(side="left")
         RBtn(bi, "Send", send_queue, h=40, w=130, primary=True, icon="send").pack(side="right")
 
+        # --- main: status strip ---
+        st = tk.Frame(mainf, bg=P["bg"]); st.pack(fill="x", padx=px(26), pady=(px(16), 0)); dot = tk.Canvas(st, width=px(10), height=px(10), bg=P["bg"], highlightthickness=0)
+        dot.create_oval(1, 1, px(10) - 1, px(10) - 1, fill=P["ok"], outline=""); dot.pack(side="left")
+        tk.Label(st, text=f"Ready to receive   -   {', '.join(H.local_ips()[:1]) or 'no network'}:{cfg['port']}", bg=P["bg"], fg=P["muted"], font=F(9)).pack(side="left", padx=px(10))
+        W["speed"] = tk.Label(st, text="Idle", bg=P["bg"], fg=P["text"], font=F(10, True)); W["speed"].pack(side="right")
+
         # --- main: scrolling content ---
         sfm = ScrollFrame(mainf); sfm.pack(fill="both", expand=True); body = sfm.inner
         dz = RCard(body, fill=P["bg"], pad=22, r=18, dash=True); dz.pack(fill="x", padx=px(26), pady=(px(26), px(8))); zi = dz.inner
@@ -600,16 +676,16 @@ def main():
         W["dest"] = tk.Entry(body, bg=P["card"], fg=P["text"], insertbackground=P["text"], relief="flat", font=F(10)); W["dest"].pack(fill="x", padx=px(26), ipady=px(8))
 
         xh = tk.Frame(body, bg=P["bg"]); xh.pack(fill="x", padx=px(26), pady=(px(24), px(6)))
-        tk.Label(xh, text="TRANSFERS", bg=P["bg"], fg=P["muted"], font=F(9, True)).pack(side="left"); RBtn(xh, "Cancel all", lambda: [c.cancel.set() for c in active], h=30, icon="close").pack(side="right")
+        tk.Label(xh, text="TRANSFERS", bg=P["bg"], fg=P["muted"], font=F(9, True)).pack(side="left"); RBtn(xh, "Cancel all", lambda: [c.cancel.set() for c in active], h=30, icon="close").pack(side="right"); RBtn(xh, "Clear cache", clear_cache_ui, h=30, icon="trash").pack(side="right", padx=px(8))
         W["xbox"] = tk.Frame(body, bg=P["bg"]); W["xbox"].pack(fill="x", padx=px(26), pady=(0, px(26)))
 
         # --- restore state after a (re)build ---
         for e in queue_: QueueRow(W["qbox"], e, remove_row).pack(fill="x", pady=px(4))
         show_devices(dict(devices), keep=True)
-        for c, (ok, msg) in list(done_.items()):   # finished cards stay visible for their 15 s even across a theme change
+        for c, (state, msg) in list(done_.items()):   # finished / paused cards survive a theme change
             card = make_card(c)
             if c.names: card.set_files(c.names, c.sizes)
-            paint_done(card, c, ok, msg)
+            paint_done(card, c, state, msg)
         for c in list(active):
             card = make_card(c)
             if c.names: card.set_files(c.names, c.sizes); card.update_files(c.fdone)
@@ -626,7 +702,7 @@ def main():
     for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"): root.bind_all(ev, wheel)
     root.bind_all("<Control-v>", lambda e: paste() if not isinstance(e.widget, (tk.Entry, tk.Text)) else None)
 
-    build(); pump(); WIN.hook_dropfiles(root, lambda files: ui(add_paths, files))
+    build(); restore_jobs(); pump(); WIN.hook_dropfiles(root, lambda files: ui(add_paths, files))
     threading.Thread(target=server, daemon=True).start(); threading.Thread(target=H.discovery_server, args=(cfg,), daemon=True).start()
     refresh(); root.mainloop(); H.save_cfg(cfg)
 
