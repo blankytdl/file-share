@@ -25,14 +25,14 @@ On the PC you can also pick a different folder for one transfer in the Accept di
 ## What's in the apps
 - **PC:** sidebar (devices, receive-into folder, themes) + main area with a **drag-and-drop** zone, **Ctrl+V / Paste** (files copied in Explorer, or text),
   an editable **To send** list (remove one item or clear all), sticky Send bar, and transfer cards with an overall bar **and a progress bar for every file**
-  (for both sending and receiving). Six colour themes (Midnight, Ocean, Emerald, Sunset, Orchid, Daylight), sharp text on high-DPI screens,
+  (for both sending and receiving). Ten colour themes (Midnight, Crimson, **Redline** red+black, **Mono Dark** black+white, **Mono Light** white+black, Ocean, Emerald, Sunset, Orchid, Daylight), sharp text on high-DPI screens,
   a title bar coloured to match the theme (Windows 10/11).
 - **Android:** the same send list, Paste button, per-file progress and themes; Send bar stays on screen.
 
 ## Reliability: pause, resume, power cuts, cache
 - **Pause / Resume** on every transfer card (play/pause button). Pausing keeps the partial data; Resume continues from the exact byte.
   The receiver can pause too: the sender then waits and carries on by itself when the receiver resumes.
-- **Dropped connection / sleeping phone / Wi-Fi hiccup:** both apps reconnect automatically for 5 minutes (Settings > "Keep reconnecting for")
+- **Dropped connection / sleeping phone / Wi-Fi hiccup:** both apps reconnect automatically for 15 minutes (Settings > "Keep reconnecting for")
   and continue where they stopped. A transfer you already accepted is never asked about again on reconnect.
 - **Power cut or crash:** unfinished sends are saved. On the next start they appear as **paused** cards with a Resume button.
   Android can resume files you picked with the file chooser or the folder chooser, and apps; things pasted from other apps cannot be reopened after a restart.
@@ -43,12 +43,23 @@ On the PC you can also pick a different folder for one transfer in the Accept di
 - Faster: large network buffers, disk + hashing overlapped with sending on the PC, Wi-Fi high-performance lock on Android, light animations while a transfer runs.
 - Files named with characters Windows refuses (`: ? " < > |`) are saved with `_` instead of failing; Windows antivirus locks no longer fail a finished file.
 
-## If "Scan" finds nothing
-1. Both devices on the same hotspot / Wi-Fi (or USB tether).
-2. **Windows Firewall:** the first time HotShare.exe runs, allow it on *Private* networks (UDP 45454 + TCP 45455). If you clicked Cancel, re-allow it in
-   Windows Security > Firewall > Allow an app.
-3. Android now pins itself to the Wi-Fi network (phones otherwise send app traffic over mobile data when the Wi-Fi has no internet) and, if broadcasts
-   are blocked, automatically probes every address on the network. You can also tap **Add IP** and type the PC's address (shown under the HotShare title).
+## If the phone cannot find or send to the PC (but the PC finds the phone)
+That is almost always **Windows Firewall** on the PC (hotspot networks count as "Public", which the default prompt does not cover).
+HotShare now handles it two ways:
+1. **One-click fix:** on Windows the app notices the missing rule, shows a warning bar and offers *Allow in Windows Firewall* (one Windows approval prompt;
+   also in Settings). It replaces any blocking rules with a single allow rule for all networks.
+2. **Works even without the fix:** the PC knocks on every phone it finds every few seconds. The phone then lists the PC by itself, and when you send to
+   it and the PC can't be reached directly, the phone waits and the PC **pulls** the files over a connection the PC opens. Keep HotShare open on the PC.
+Other checks: both devices on the same network; Android is pinned to the Wi-Fi even if it has no internet; use **Add IP** as a last resort.
+
+## Transfers that stop when the phone sleeps
+Android cuts network access for background apps when the screen turns off. HotShare asks once to be allowed to ignore battery optimisation
+(also in Settings > "Allow background activity"). On Xiaomi/Huawei/Samsung also set HotShare to "Unrestricted" battery use.
+
+## "It restarted at 100%" (fixed)
+After the last byte the receiver verifies, saves and virus-scans the file, which can take minutes for big files. The sender used to treat the wait as a
+dead connection, reconnect and send everything again. Now the receiver remembers files it has already saved (a reconnect skips them), and the sender waits
+patiently for the final "DONE".
 
 ## Using it
 Put both devices on the same hotspot / Wi-Fi / USB-tether link, open the app on both, tap Refresh/Scan, select the other

@@ -30,6 +30,7 @@ import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -53,12 +54,14 @@ object Core {
     }
     class Approval(val id: Int, val peer: String, val count: Int, val total: Long) { val latch = CountDownLatch(1); @Volatile var result = 3 }
     class Declined(m: String) : IOException(m)
+    class Unreachable(m: String) : IOException(m)
+    class ReverseConn(val inp: InputStream, val out: OutputStream, val sock: Socket?, val done: CountDownLatch)
     class Paused(m: String) : IOException(m)
     class PeerPaused(m: String) : IOException(m)
     class JobInfo(val id: String, val name: String, val names: List<String>, val sizes: List<Long>)
     interface Ui {
         fun log(m: String); fun files(t: Transfer); fun started(t: Transfer); fun progress(t: Transfer); fun state(t: Transfer, s: String, msg: String)
-        fun finished(t: Transfer, state: String, msg: String); fun approve(a: Approval); fun dismiss(id: Int); fun text(peer: String, t: String)
+        fun finished(t: Transfer, state: String, msg: String); fun approve(a: Approval); fun dismiss(id: Int); fun text(peer: String, t: String); fun peers()
     }
 
     lateinit var app: Context
@@ -69,6 +72,10 @@ object Core {
     val active = ConcurrentHashMap<Int, Transfer>()
     val approvals = ConcurrentHashMap<Int, Approval>()
     private val cancelledKeys = ConcurrentHashMap<String, Long>()          // transfers YOU cancelled: a reconnecting sender must not restart them
+    private val finished = ConcurrentHashMap<String, MutableSet<String>>()          // transfer key -> file ids already SAVED: a reconnect never resends them
+    private val finalizing: MutableSet<String> = ConcurrentHashMap.newKeySet()      // ids being copied into place right now
+    private val slots = ConcurrentHashMap<String, SynchronousQueue<ReverseConn>>()   // senders waiting for a device to open a connection to us (pull mode)
+    val peers = ConcurrentHashMap<String, Dev>(); private val peerTime = ConcurrentHashMap<String, Long>()   // devices that knocked on us (they may be invisible to our scan, e.g. a PC behind a firewall)
     private val approved = ConcurrentHashMap<String, Long>()                 // a transfer you accepted is never asked about again on reconnect
     private val pausedKeys: MutableSet<String> = ConcurrentHashMap.newKeySet()   // incoming transfers YOU paused: the sender waits
     private val memItems = ConcurrentHashMap<String, List<Item>>(); private val memJobs = ConcurrentHashMap<String, Pair<Dev, String>>()
@@ -181,6 +188,7 @@ object Core {
     /** Erases partial files of unfinished transfers, staged copies and the interrupted-send list. Returns bytes freed, or -1 if a transfer is running. */
     fun clearCache(): Long {
         if (active.isNotEmpty()) return -1L
+        finished.clear()
         val n = cacheBytes(); File(partialDir()).listFiles()?.forEach { it.delete() }; app.cacheDir.listFiles()?.filter { it.name.startsWith("tmp_") }?.forEach { it.delete() }
         prefs.edit().remove("jobs").apply(); memItems.clear(); memJobs.clear(); return n
     }
@@ -227,44 +235,64 @@ object Core {
     }
     fun textItem(t: String): Item { val b = t.toByteArray(); return Item("text", b.size.toLong(), 0, t) { ByteArrayInputStream(b) } }
 
-    // ---------- sending (auto-reconnect, pause / resume, saved jobs) ----------
-    private fun reconnectMs() = (cfg("reconnect_s", "300").toLongOrNull() ?: 300L).coerceAtLeast(10L) * 1000L
+    // ---------- sending (auto-reconnect, pause / resume, saved jobs, pull mode) ----------
+    private fun reconnectMs() = (cfg("reconnect_s", "900").toLongOrNull() ?: 900L).coerceAtLeast(10L) * 1000L
     private fun sleepOrStop(t: Transfer, ms: Long): String? {
         val until = System.currentTimeMillis() + ms
         while (System.currentTimeMillis() < until) { if (t.cancelled) return "cancelled"; if (t.paused) return "paused"; try { Thread.sleep(150) } catch (_: InterruptedException) {} }
         return null
     }
+    private fun hint(name: String) = "Could not reach $name. Check that HotShare is open there and both devices are on the same network."
 
     fun sendTo(dev: Dev, items: List<Item>, dest: String, existing: String? = null) {
         val jid = existing ?: UUID.randomUUID().toString().take(12)
         memItems[jid] = items; memJobs[jid] = Pair(dev, dest); persistJob(jid, dev, items, dest)       // saved first: survives a crash / power cut
         val t = begin("To ${dev.name}", false); t.jobId = jid
-        var attempt = 0; var deadline = 0L; var seen = -1L
-        while (true) {
-            try { sendOnce(dev, items, dest, t); dropJob(jid); end(t, "ok", "Sent ${items.size} item(s)"); return }
-            catch (e: IOException) {
-                if (t.cancelled) { dropJob(jid); end(t, "cancelled", "cancelled; cached data discarded"); return }
-                if (t.paused || e is Paused) { end(t, "paused", "press Resume to continue"); return }
-                if (e is Declined) { dropJob(jid); end(t, "fail", e.message ?: "declined"); return }
-                val delay: Long
-                if (e is PeerPaused) { setState(t, "waiting", "Paused by the receiver - waiting for it to resume"); delay = 2000L }
-                else {
-                    if (e is ConnectException && t.moved == 0L && !t.connectedOnce) { end(t, "paused", "cannot reach ${dev.name} - is HotShare open there? Press Resume to retry"); return }
-                    val now = System.currentTimeMillis()
-                    if (t.moved != seen) { seen = t.moved; attempt = 0; deadline = 0L }          // progress since the last failure -> fresh window
-                    if (deadline == 0L) deadline = now + reconnectMs()
-                    if (now > deadline) { end(t, "paused", "connection lost - press Resume when the other device is back"); return }
-                    attempt++; delay = minOf(10000L, (1500 * Math.pow(1.5, (attempt - 1).toDouble())).toLong())
-                    setState(t, "reconnecting", "Connection lost - reconnecting in ${delay / 1000 + 1}s")
+        var attempt = 0; var deadline = 0L; var seen = -1L; var pull = false; var pullUntil = 0L
+        try {
+            while (true) {
+                try {
+                    if (pull) {
+                        if (System.currentTimeMillis() > pullUntil) { end(t, "paused", "nobody picked this up - open HotShare on ${dev.name}, then press Resume"); return }
+                        if (!pullOnce(dev, items, dest, t)) continue
+                    } else sendOnce(dev, items, dest, t)
+                    dropJob(jid); end(t, "ok", "Sent ${items.size} item(s)"); return
+                } catch (e: IOException) {
+                    if (t.cancelled) { dropJob(jid); end(t, "cancelled", "cancelled; cached data discarded"); return }
+                    if (t.paused || e is Paused) { end(t, "paused", "press Resume to continue"); return }
+                    if (e is Declined) { dropJob(jid); end(t, "fail", e.message ?: "declined"); return }
+                    if (e is Unreachable && t.moved == 0L && !t.connectedOnce && !pull) { pull = true; pullUntil = System.currentTimeMillis() + reconnectMs(); continue }   // a PC behind a firewall can still pick this up
+                    val delay: Long
+                    if (e is PeerPaused) { setState(t, "waiting", "Paused by the receiver - waiting for it to resume"); delay = 2000L }
+                    else {
+                        val now = System.currentTimeMillis()
+                        if (t.moved != seen) { seen = t.moved; attempt = 0; deadline = 0L }          // progress since the last failure -> fresh window
+                        if (deadline == 0L) deadline = now + reconnectMs()
+                        if (now > deadline) { end(t, "paused", "connection lost - press Resume when the other device is back"); return }
+                        attempt++; delay = minOf(10000L, (1500 * Math.pow(1.5, (attempt - 1).toDouble())).toLong())
+                        setState(t, "reconnecting", "Connection lost - reconnecting in ${delay / 1000 + 1}s")
+                    }
+                    when (sleepOrStop(t, delay)) {
+                        "cancelled" -> { dropJob(jid); end(t, "cancelled", "cancelled; cached data discarded"); return }
+                        "paused" -> { end(t, "paused", "press Resume to continue"); return }
+                    }
                 }
-                when (sleepOrStop(t, delay)) {
-                    "cancelled" -> { dropJob(jid); end(t, "cancelled", "cancelled; cached data discarded"); return }
-                    "paused" -> { end(t, "paused", "press Resume to continue"); return }
-                }
+                catch (e: SecurityException) { dropJob(jid); end(t, "fail", "files are no longer accessible - add them again"); return }
+                catch (e: Exception) { end(t, "paused", (e.message ?: "failed") + " - press Resume to retry"); return }
             }
-            catch (e: SecurityException) { dropJob(jid); end(t, "fail", "files are no longer accessible - add them again"); return }
-            catch (e: Exception) { end(t, "paused", (e.message ?: "failed") + " - press Resume to retry"); return }
+        } finally { slots.remove(dev.addr) }
+    }
+    /** The other device cannot be reached directly (firewall). Wait for it to knock (it polls every few seconds) and send over ITS connection. */
+    private fun pullOnce(dev: Dev, items: List<Item>, dest: String, t: Transfer): Boolean {
+        val slot = slots.getOrPut(dev.addr) { SynchronousQueue() }
+        setState(t, "waiting", "Cannot connect directly (firewall?). Waiting for ${dev.name} to pick this up - keep HotShare open on it")
+        val until = System.currentTimeMillis() + 10000
+        while (System.currentTimeMillis() < until) {
+            if (t.cancelled) throw InterruptedIOException("cancelled"); if (t.paused) throw Paused("paused")
+            val conn = slot.poll(500, TimeUnit.MILLISECONDS) ?: continue
+            try { sendStream(conn.inp, conn.out, items, dest, t, dev.name, conn.sock); return true } finally { conn.done.countDown() }
         }
+        return false
     }
     private fun sendOnce(dev: Dev, items: List<Item>, dest: String, t: Transfer) {
         setState(t, "connecting", "Connecting...")
@@ -273,41 +301,47 @@ object Core {
             val ad = BluetoothAdapter.getDefaultAdapter(); val s = ad.getRemoteDevice(dev.addr.substring(3)).createRfcommSocketToServiceRecord(BT_UUID); ad.cancelDiscovery(); s.connect()
             sock = s; rin = s.inputStream; rout = s.outputStream
         } else {
-            bindLanNow(); val s = Socket(); tune(s); s.connect(InetSocketAddress(dev.addr, dev.port), 8000); s.soTimeout = 180000   // long: the receiver may be waiting for a tap on Accept
-            plain = s; sock = s; rin = s.inputStream; rout = s.outputStream
+            bindLanNow(); val s = Socket(); tune(s)
+            try { s.connect(InetSocketAddress(dev.addr, dev.port), 8000) }
+            catch (e: IOException) { try { s.close() } catch (_: Exception) {}; throw if (e is SocketTimeoutException || e is ConnectException || e is NoRouteToHostException) Unreachable(hint(dev.name)) else e }
+            s.soTimeout = 180000; plain = s; sock = s; rin = s.inputStream; rout = s.outputStream   // long: the receiver may be waiting for a tap on Accept
         }
-        sock.use {
-            val inp = BufferedInputStream(rin, BUF); val out = BufferedOutputStream(rout, BUF)
-            val man = JSONArray(); val ids = HashMap<Item, String>(); val sent = ArrayList<Item>(); var total = 0L
-            for (item in items) {
-                if (item.text != null) { man.put(JSONObject().put("id", "t${sent.size}").put("t", "text").put("path", "text").put("size", item.size).put("text", item.text)); sent.add(item) }
-                else { val id = fid(item.rel, item.size, item.mtime); if (ids.containsValue(id)) continue; ids[item] = id; sent.add(item); total += item.size; man.put(JSONObject().put("id", id).put("t", "file").put("path", item.rel).put("size", item.size)) }
-            }
-            out.write("HSH3\n${JSONObject().put("name", cfg("name", Build.MODEL)).put("pin", cfg("pin")).put("dest", dest).put("files", man)}\n".toByteArray()); out.flush()
-            val resp = readLine(inp)
-            if (resp.startsWith("ERR")) { val m = resp.drop(4); throw if (m == "paused") PeerPaused(m) else Declined(m) }
-            if (resp != "OK") throw Declined("${dev.name} declined (or PIN mismatch)")
-            t.connectedOnce = true; plain?.soTimeout = 60000; setState(t, "running", "")
-            val offs = JSONObject(readLine(inp, MAXH)).getJSONObject("off")
-            var done = 0L; for (id in ids.values) done += offs.optLong(id, 0)
-            t.total = total; t.base = done; t.t0 = System.currentTimeMillis(); val buf = ByteArray(BUF); val md = MessageDigest.getInstance("SHA-256")
-            setFiles(t, sent.map { if (it.text != null) "Text message" else it.rel }.toTypedArray(), sent.map { it.size }.toLongArray())
-            sent.forEachIndexed { ix, x -> val xid = ids[x]; t.fdone[ix] = if (xid == null) x.size else offs.optLong(xid, 0).coerceIn(0, x.size) }
-            for ((ix, item) in sent.withIndex()) {
-                if (item.text != null) continue
-                val id = ids[item]!!; val off = offs.optLong(id, 0).coerceIn(0, item.size); md.reset()
-                item.open().use { s ->
-                    var left = off; while (left > 0) { val n = s.read(buf, 0, minOf(buf.size.toLong(), left).toInt()); if (n < 0) throw IOException("file changed"); md.update(buf, 0, n); left -= n }
-                    left = item.size - off
-                    while (left > 0) { val n = s.read(buf, 0, minOf(buf.size.toLong(), left).toInt()); if (n < 0) throw IOException("file shrank"); out.write(buf, 0, n); md.update(buf, 0, n); left -= n; done += n; t.fdone[ix] = item.size - left; tick(t, done) }
-                }
-                out.write((hex(md.digest()) + "\n").toByteArray()); t.fdone[ix] = item.size
-            }
-            out.flush(); val r = readLine(inp)
-            if (r == "ERR paused") throw PeerPaused("paused")
-            if (r != "DONE") throw IOException(r.ifEmpty { "no reply" })
-            tick(t, total); sent.forEach { history("out", it.rel, it.size, dev.name) }
+        sock.use { sendStream(BufferedInputStream(rin, BUF), BufferedOutputStream(rout, BUF), items, dest, t, dev.name, plain) }
+    }
+    /** The sender side of HSH3 on an open connection (used for normal sends and for connections the other device opened to us). */
+    private fun sendStream(inp: InputStream, out: OutputStream, items: List<Item>, dest: String, t: Transfer, devName: String, plain: Socket?) {
+        val man = JSONArray(); val ids = HashMap<Item, String>(); val sent = ArrayList<Item>(); var total = 0L
+        for (item in items) {
+            if (item.text != null) { man.put(JSONObject().put("id", "t${sent.size}").put("t", "text").put("path", "text").put("size", item.size).put("text", item.text)); sent.add(item) }
+            else { val id = fid(item.rel, item.size, item.mtime); if (ids.containsValue(id)) continue; ids[item] = id; sent.add(item); total += item.size; man.put(JSONObject().put("id", id).put("t", "file").put("path", item.rel).put("size", item.size)) }
         }
+        out.write("HSH3\n${JSONObject().put("name", cfg("name", Build.MODEL)).put("pin", cfg("pin")).put("dest", dest).put("files", man)}\n".toByteArray()); out.flush()
+        val resp = readLine(inp)
+        if (resp.startsWith("ERR")) { val m = resp.drop(4); throw if (m == "paused") PeerPaused(m) else Declined(m) }
+        if (resp != "OK") throw Declined("$devName declined (or PIN mismatch)")
+        t.connectedOnce = true; plain?.soTimeout = 300000; setState(t, "running", "")
+        val reply = JSONObject(readLine(inp, MAXH)); val offs = reply.getJSONObject("off"); val dones = HashSet<String>()
+        reply.optJSONArray("done")?.let { a -> for (i in 0 until a.length()) dones.add(a.getString(i)) }          // files the receiver has ALREADY SAVED: never resend them
+        var done = 0L; for ((x, id) in ids) done += if (id in dones) x.size else offs.optLong(id, 0)
+        t.total = total; t.base = done; t.t0 = System.currentTimeMillis(); val buf = ByteArray(BUF); val md = MessageDigest.getInstance("SHA-256")
+        setFiles(t, sent.map { if (it.text != null) "Text message" else it.rel }.toTypedArray(), sent.map { it.size }.toLongArray())
+        sent.forEachIndexed { ix, x -> val xid = ids[x]; t.fdone[ix] = if (xid == null || xid in dones) x.size else offs.optLong(xid, 0).coerceIn(0, x.size) }
+        for ((ix, item) in sent.withIndex()) {
+            if (item.text != null) continue
+            val id = ids[item]!!; if (id in dones) continue
+            val off = offs.optLong(id, 0).coerceIn(0, item.size); md.reset()
+            item.open().use { s ->
+                var left = off; while (left > 0) { val n = s.read(buf, 0, minOf(buf.size.toLong(), left).toInt()); if (n < 0) throw IOException("file changed"); md.update(buf, 0, n); left -= n }
+                left = item.size - off
+                while (left > 0) { val n = s.read(buf, 0, minOf(buf.size.toLong(), left).toInt()); if (n < 0) throw IOException("file shrank"); out.write(buf, 0, n); md.update(buf, 0, n); left -= n; done += n; t.fdone[ix] = item.size - left; tick(t, done) }
+            }
+            out.write((hex(md.digest()) + "\n").toByteArray()); t.fdone[ix] = item.size
+        }
+        out.flush(); plain?.soTimeout = 1800000          // the receiver may spend minutes saving a big file before it says DONE: that is not a dead connection
+        val r = readLine(inp)
+        if (r == "ERR paused") throw PeerPaused("paused")
+        if (r != "DONE") throw IOException(r.ifEmpty { "no reply" })
+        tick(t, total); sent.forEach { history("out", it.rel, it.size, devName) }
     }
 
     // ---------- receiving ----------
@@ -321,13 +355,28 @@ object Core {
     fun answer(id: Int, res: Int) { approvals[id]?.let { it.result = res; it.latch.countDown() } }
     fun onUiGone() { approvals.values.forEach { Notifier.approval(it) } }
 
-    private fun handle(rin: InputStream, rout: OutputStream) {
+    private fun handle(rin: InputStream, rout: OutputStream, sock: Socket? = null) {
         val inp = BufferedInputStream(rin, BUF); val out = BufferedOutputStream(rout, BUF)
         val first = readLine(inp)
         if (first == "HSH?") {   // discovery over the transfer port (works where UDP broadcast is blocked)
             if (prefs.getBoolean("visible", true)) { out.write("${JSONObject().put("name", cfg("name", Build.MODEL)).put("port", cfg("port", "45455").toInt()).put("os", "Android")}\n".toByteArray()); out.flush() }
             return
         }
+        if (first == "HSHR") {   // the other device opened this connection to collect files we are waiting to send it (it may be unreachable from here: firewall)
+            val info = JSONObject(readLine(inp)); val ip = sock?.inetAddress?.hostAddress ?: ""; val myPin = cfg("pin")
+            if (myPin.isNotEmpty() && info.optString("pin") != myPin) { out.write("HSHN\n".toByteArray()); out.flush(); return }
+            if (ip.isNotEmpty()) {
+                val old = peers.put(ip, Dev(info.optString("name", "PC"), ip, info.optInt("port", 45455), info.optString("os"))); peerTime[ip] = System.currentTimeMillis()
+                if (old == null) ui?.peers()          // it now shows up in our device list even though our own scan cannot reach it
+            }
+            touch(); val slot = slots[ip]
+            if (slot == null) { out.write("HSHN\n".toByteArray()); out.flush(); return }
+            sock?.soTimeout = 180000
+            val conn = ReverseConn(inp, out, sock, CountDownLatch(1))
+            if (!slot.offer(conn, 1500, TimeUnit.MILLISECONDS)) { out.write("HSHN\n".toByteArray()); out.flush(); return }
+            conn.done.await(); return                 // the sending thread now owns the streams; the socket is closed when we return
+        }
+        if (first == "HSHN") return
         if (first != "HSH3") return
         touch()
         val h = JSONObject(readLine(inp, MAXH)); val peer = h.optString("name", "?"); val pin = cfg("pin"); val files = h.getJSONArray("files")
@@ -345,32 +394,40 @@ object Core {
         val t = begin(peer, true); t.total = total; t.key = key; var got = 0; val parts = HashMap<String, File>()
         try {
             val pdir = File(partialDir()); val offs = JSONObject(); var done = 0L
+            val waitFrom = System.currentTimeMillis()      // an earlier connection may still be copying a big file into place: wait until it is saved
+            while ((0 until files.length()).any { files.getJSONObject(it).optString("id") in finalizing } && System.currentTimeMillis() - waitFrom < 900000L) Thread.sleep(200)
+            val allIds = (0 until files.length()).map { files.getJSONObject(it).getString("id") }.toSet(); val fin: Set<String> = (finished[key]?.toSet() ?: emptySet()).intersect(allIds)
+            var finBytes = 0L
             for (i in 0 until files.length()) {
                 val f = files.getJSONObject(i); if (f.getString("t") != "file") continue
+                if (f.getString("id") in fin) { finBytes += f.getLong("size"); continue }
                 val p = File(pdir, f.getString("id").filter { it.isLetterOrDigit() }.take(40) + ".part"); parts[f.getString("id")] = p
                 var n = if (p.exists()) p.length() else 0L; if (n > f.getLong("size")) { p.delete(); n = 0 }
                 offs.put(f.getString("id"), n); done += n
             }
             t.parts = parts.values.toList()
-            if (pdir.usableSpace < total - done) { out.write("ERR not enough free space\n".toByteArray()); out.flush(); throw Declined("not enough free space") }
-            out.write("OK\n${JSONObject().put("off", offs)}\n".toByteArray()); out.flush()
+            if (pdir.usableSpace < total - finBytes - done) { out.write("ERR not enough free space\n".toByteArray()); out.flush(); throw Declined("not enough free space") }
+            done += finBytes
+            out.write("OK\n${JSONObject().put("off", offs).put("done", JSONArray(fin.toList()))}\n".toByteArray()); out.flush()
             setFiles(t, Array(files.length()) { val fo = files.getJSONObject(it); if (fo.getString("t") == "file") fo.getString("path") else "Text message" }, LongArray(files.length()) { files.getJSONObject(it).optLong("size", 0) })
-            for (i in 0 until files.length()) { val fo = files.getJSONObject(i); if (fo.getString("t") == "file") t.fdone[i] = offs.getLong(fo.getString("id")) }
+            for (i in 0 until files.length()) { val fo = files.getJSONObject(i); t.fdone[i] = if (fo.getString("id") in fin) t.sizes[i] else if (fo.getString("t") == "file") offs.getLong(fo.getString("id")) else 0L }
             t.base = done; t.t0 = System.currentTimeMillis(); val buf = ByteArray(BUF); val md = MessageDigest.getInstance("SHA-256")
             val dest = h.optString("dest").replace("\\", "/").split("/").filter { it.isNotEmpty() && it != "." && it != ".." }.map { cleanSeg(it) }
             for (i in 0 until files.length()) {
-                val f = files.getJSONObject(i)
-                if (f.getString("t") == "text") { val s = f.optString("text").take(1_000_000); val u = ui; if (u != null) u.text(peer, s) else Notifier.info("Text from $peer", s.take(300)); history("in", "text", s.toByteArray().size.toLong(), peer); t.fdone[i] = t.sizes[i]; continue }
-                val rel = f.getString("path"); val size = f.getLong("size"); val part = parts[f.getString("id")]!!; val off = offs.getLong(f.getString("id")); md.reset()
+                val f = files.getJSONObject(i); val fidv = f.getString("id"); if (fidv in fin) continue
+                if (f.getString("t") == "text") { val s = f.optString("text").take(1_000_000); val u = ui; if (u != null) u.text(peer, s) else Notifier.info("Text from $peer", s.take(300)); history("in", "text", s.toByteArray().size.toLong(), peer); t.fdone[i] = t.sizes[i]; finished.getOrPut(key) { ConcurrentHashMap.newKeySet<String>() }.add(fidv); continue }
+                val rel = f.getString("path"); val size = f.getLong("size"); val part = parts[fidv]!!; val off = offs.getLong(fidv); md.reset()
                 if (off > 0) { log("Resuming $rel from ${off / 1048576} MB"); FileInputStream(part).use { s -> while (true) { val n = s.read(buf); if (n < 0) break; md.update(buf, 0, n) } } }
                 var left = size - off
                 FileOutputStream(part, true).use { o -> while (left > 0) { val n = inp.read(buf, 0, minOf(buf.size.toLong(), left).toInt()); if (n < 0) throw IOException("connection lost"); o.write(buf, 0, n); md.update(buf, 0, n); left -= n; done += n; t.fdone[i] = size - left; tick(t, done) } }
                 if (readLine(inp) != hex(md.digest())) { part.delete(); throw IOException("checksum mismatch: $rel") }
                 val segs = rel.replace("\\", "/").split("/").filter { it.isNotEmpty() && it != "." && it != ".." }.map { cleanSeg(it) }
-                saveFinal(part, dest + segs.dropLast(1), segs.lastOrNull() ?: "file"); part.delete(); got++; t.fdone[i] = size     // cache erased as soon as the file is safely saved
-                history("in", rel, size, peer); log("Received $rel (verified)")
+                finalizing.add(fidv)
+                try { saveFinal(part, dest + segs.dropLast(1), segs.lastOrNull() ?: "file"); part.delete() } finally { finalizing.remove(fidv) }     // cache erased as soon as the file is safely saved
+                finished.getOrPut(key) { ConcurrentHashMap.newKeySet<String>() }.add(fidv)          // from now on a reconnecting sender skips this file entirely
+                got++; t.fdone[i] = size; history("in", rel, size, peer); log("Received $rel (verified)")
             }
-            out.write("DONE\n".toByteArray()); out.flush(); tick(t, total); end(t, "ok", "Received $got file(s)")
+            out.write("DONE\n".toByteArray()); out.flush(); finished.remove(key); tick(t, total); end(t, "ok", "Received $got file(s)")
         } catch (e: Exception) {
             try { out.write((if (e is Paused) "ERR paused\n" else "ERR ${e.message}\n").toByteArray()); out.flush() } catch (_: Exception) {}
             if (t.discard) parts.values.forEach { it.delete() }
@@ -423,7 +480,7 @@ object Core {
         val ss = ServerSocket().apply { reuseAddress = true; receiveBufferSize = 4 shl 20; bind(InetSocketAddress(cfg("port", "45455").toInt())) }; tcp = ss
         while (!ss.isClosed) {
             val c = try { ss.accept() } catch (_: IOException) { break }
-            daemon { tune(c); c.soTimeout = 45000; c.use { try { handle(it.getInputStream(), it.getOutputStream()) } catch (e: Exception) { log("Receive error: ${e.message}") } } }
+            daemon { tune(c); c.soTimeout = 120000; c.use { try { handle(it.getInputStream(), it.getOutputStream(), it) } catch (e: Exception) { log("Receive error: ${e.message}") } } }
         }
     }
     private fun udpLoop() {
@@ -494,7 +551,9 @@ object Core {
         try { while (true) { val p = DatagramPacket(b, b.size); s.receive(p); val ip = p.address.hostAddress ?: continue; if (ip in mine) continue
             try { val j = JSONObject(String(p.data, 0, p.length)); res[ip] = Dev(j.getString("name"), ip, j.getInt("port"), j.optString("os")) } catch (_: Exception) {} } } catch (_: SocketTimeoutException) {}
         s.close(); val found = res.values.toList()
-        return if (found.isNotEmpty()) found else sweep(cfg("port", "45455").toInt())
+        val list = if (found.isNotEmpty()) found else sweep(cfg("port", "45455").toInt())
+        val now = System.currentTimeMillis()
+        return list + peers.values.filter { p -> (peerTime[p.addr] ?: 0L) > now - 120000L && list.none { it.addr == p.addr } }
     }
 }
 

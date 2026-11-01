@@ -19,6 +19,8 @@ import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.provider.DocumentsContract
 import android.text.InputType
 import android.text.TextUtils
@@ -76,7 +78,7 @@ class MainActivity : Activity(), Core.Ui {
     }
     private fun chip(ic: String, text: String, primary: Boolean = false, f: () -> Unit) = LinearLayout(this).apply {
         gravity = Gravity.CENTER; setPadding(dp(10), dp(12), dp(10), dp(12)); background = roundBg(if (primary) C.accent else C.card2, dp(14).toFloat())
-        val c = if (primary) Color.WHITE else C.text
+        val c = if (primary) C.onAccent else C.text
         addView(ico(ic, 18, c)); addView(tv(text, 13f, c, true).apply { setPadding(dp(7), 0, 0, 0); maxLines = 1 }); press(f)
     }
     private fun rowOf(vararg v: View) = LinearLayout(this).apply { v.forEach { addView(it, LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(dp(4), dp(4), dp(4), dp(4)) }) } }
@@ -86,6 +88,17 @@ class MainActivity : Activity(), Core.Ui {
     }
     private fun size(n: Long) = if (n < 1 shl 20) "${n / 1024} KB" else if (n < 1L shl 30) "%.1f MB".format(n / 1048576.0) else "%.2f GB".format(n / 1073741824.0)
     private fun toast(m: String) = runOnUiThread { Toast.makeText(this, m, Toast.LENGTH_LONG).show() }
+    private fun batteryOk(): Boolean = (getSystemService(Context.POWER_SERVICE) as PowerManager).isIgnoringBatteryOptimizations(packageName)
+    private fun requestBattery() {
+        try { startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))) }
+        catch (e: Exception) { try { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) } catch (_: Exception) { toast("Open Settings > Battery and let HotShare run in the background") } }
+    }
+    private fun askBatteryOnce() {
+        if (batteryOk() || Core.prefs.getBoolean("battery_asked", false)) return
+        Core.prefs.edit().putBoolean("battery_asked", true).apply()
+        dlg().setTitle("Keep transfers running with the screen off").setMessage("Android cuts off network access for background apps when the screen turns off, which stops transfers. Allow HotShare to ignore battery optimisation so transfers continue while your phone sleeps.")
+            .setPositiveButton("Allow") { _, _ -> requestBattery() }.setNegativeButton("Not now", null).show()
+    }
     private fun subtitle() = "${Core.cfg("name", Build.MODEL)}   -   ${Core.localIps().firstOrNull() ?: "not connected"}"
     private fun treeIntent() = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
 
@@ -131,7 +144,7 @@ class MainActivity : Activity(), Core.Ui {
         val head = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         head.addView(FrameLayout(this).apply {
             background = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(C.accent, C.accent2)).apply { cornerRadius = dp(14).toFloat() }
-            addView(IconView(this@MainActivity, "exchange", Color.WHITE), FrameLayout.LayoutParams(dp(28), dp(28), Gravity.CENTER))
+            addView(IconView(this@MainActivity, "exchange", C.onAccent), FrameLayout.LayoutParams(dp(28), dp(28), Gravity.CENTER))
         }, LinearLayout.LayoutParams(dp(48), dp(48)))
         val titles = col().apply { setPadding(dp(14), 0, 0, 0) }
         titles.addView(tv("HotShare", 26f, C.text, true)); subv = tv(subtitle(), 13f, C.muted).apply { setPadding(0, dp(4), 0, 0) }; titles.addView(subv)
@@ -181,20 +194,20 @@ class MainActivity : Activity(), Core.Ui {
 
         // theme swatches
         root.addView(label("Theme"))
-        val sw = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        C.themes.forEach { t ->
+        val swRows = listOf(LinearLayout(this), LinearLayout(this))
+        C.themes.forEachIndexed { k, t ->
             val d = dp(32)
-            sw.addView(FrameLayout(this).apply {
+            swRows[k / 5].addView(FrameLayout(this).apply {
                 background = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(t.accent, t.accent2)).apply { shape = GradientDrawable.OVAL; if (t.name == C.name) setStroke(dp(3), C.text) }
-                if (t.name == C.name) addView(IconView(this@MainActivity, "check", Color.WHITE), FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER))
+                if (t.name == C.name) addView(IconView(this@MainActivity, "check", t.onAccent), FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER))
                 press { if (t.name != C.name) { Core.prefs.edit().putString("theme", t.name).apply(); recreate() } }
             }, LinearLayout.LayoutParams(d, d).apply { rightMargin = dp(10) })
         }
-        root.addView(sw)
+        swRows.forEach { root.addView(it, lp(top = 10)) }
 
         Q.toList().forEach { addEntryView(it) }; syncBar()
         for (i in 0 until root.childCount) root.getChildAt(i).apply { alpha = 0f; translationY = dp(24).toFloat(); animate().alpha(1f).translationY(0f).setStartDelay(i * 45L).setDuration(350).setInterpolator(DecelerateInterpolator()).start() }
-        handleShare(intent); scan()
+        handleShare(intent); scan(false)
     }
 
     override fun onNewIntent(i: Intent) { super.onNewIntent(i); handleShare(i) }
@@ -214,7 +227,7 @@ class MainActivity : Activity(), Core.Ui {
         tx.addView(tv("${d.addr.removePrefix("bt:")}   -   ${if (d.kind == "BT") "Bluetooth" else d.kind.ifEmpty { "device" }}", 12f, C.muted).apply { setPadding(0, dp(3), 0, 0) })
         row.addView(tx, LinearLayout.LayoutParams(0, -2, 1f))
         val ck = FrameLayout(this).apply { layoutParams = LinearLayout.LayoutParams(dp(28), dp(28)); background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.TRANSPARENT); setStroke(dp(2), C.muted) } }
-        val tick = IconView(this, "check", Color.WHITE).apply { alpha = 0f }; ck.addView(tick, FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER)); row.addView(ck)
+        val tick = IconView(this, "check", C.onAccent).apply { alpha = 0f }; ck.addView(tick, FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER)); row.addView(ck)
         fun paint(on: Boolean) {
             tick.animate().alpha(if (on) 1f else 0f).setDuration(160).start()
             ValueAnimator.ofArgb(if (on) C.card else C.sel, if (on) C.sel else C.card).apply { duration = 200; addUpdateListener { (row.background as GradientDrawable).setColor(it.animatedValue as Int) }; start() }
@@ -235,9 +248,9 @@ class MainActivity : Activity(), Core.Ui {
         l.forEachIndexed { i, d -> devBox.addView(devCard(i, d, d.addr in keepAddrs), lp(top = 8)) }
         syncBar()
     }
-    private fun scan() {
+    private fun scan(manual: Boolean = true) {
         radar.scanning = true; subv.text = subtitle()
-        Core.daemon { val r = try { Core.scan() } catch (e: Exception) { Core.log("Scan failed: ${e.message}"); emptyList<Dev>() }; runOnUiThread { radar.scanning = false; val merged = devs.filter { (it.kind == "IP" || it.kind == "BT") && r.none { x -> x.addr == it.addr } } + r; setDevices(merged, true); if (merged.isEmpty()) toast("No devices found. Check both are on the same network and the PC firewall allows HotShare.") } }
+        Core.daemon { val r = try { Core.scan() } catch (e: Exception) { Core.log("Scan failed: ${e.message}"); emptyList<Dev>() }; runOnUiThread { radar.scanning = false; val merged = devs.filter { (it.kind == "IP" || it.kind == "BT") && r.none { x -> x.addr == it.addr } } + r; setDevices(merged, true); if (merged.isEmpty()) { if (manual) dlg().setTitle("No devices found").setMessage("1. Both devices on the same Wi-Fi or hotspot.\n2. HotShare open on the other device.\n3. Windows PC: open HotShare there and press \"Allow in Windows Firewall\" (or just leave HotShare open on the PC: it finds this phone, then shows up here by itself within a few seconds, and you can still send to it).\n4. Or tap Add IP and type the PC's address.").setPositiveButton("OK", null).show() else toast("No devices found yet") } } }
     }
     private fun askIp() {
         val e = EditText(this).apply { hint = "192.168.x.x"; inputType = InputType.TYPE_CLASS_PHONE }
@@ -283,7 +296,7 @@ class MainActivity : Activity(), Core.Ui {
         val targets = sel.sorted().mapNotNull { devs.getOrNull(it) }
         if (targets.isEmpty()) { toast("Select one or more devices first"); return }
         val items = Q.flatMap { it.items }; val dest = destEdit.text.toString().trim()
-        clearQueue(); targets.forEach { d -> Core.daemon { Core.sendTo(d, items, dest) } }
+        askBatteryOnce(); clearQueue(); targets.forEach { d -> Core.daemon { Core.sendTo(d, items, dest) } }
     }
 
     // ---------- adding things ----------
@@ -414,6 +427,7 @@ class MainActivity : Activity(), Core.Ui {
     private fun removeCard(id: Int) { cards.remove(id)?.let { it.pulse?.cancel(); xferBox.removeView(it.view) } }
 
     // ---------- Core.Ui (called from background threads) ----------
+    override fun peers() = runOnUiThread { val add = Core.peers.values.filter { p -> devs.none { it.addr == p.addr } }; if (add.isNotEmpty()) setDevices(devs + add, true) }
     override fun log(m: String) = runOnUiThread { logv.text = (logv.text.toString().lines().filter { it.isNotEmpty() }.takeLast(3) + m).joinToString("\n") }
     override fun files(t: Core.Transfer) = runOnUiThread { val c = card(t); buildRows(c, t) }
     override fun started(t: Core.Transfer) = runOnUiThread { card(t); Unit }
@@ -457,16 +471,17 @@ class MainActivity : Activity(), Core.Ui {
         fun field(h: String, k: String, d: String, num: Boolean = false) = EditText(this).apply { hint = h; setText(Core.cfg(k, d)); if (num) inputType = InputType.TYPE_CLASS_NUMBER; l.addView(this) }
         fun sw(t: String, k: String, d: Boolean) = Switch(this).apply { text = t; isChecked = p.getBoolean(k, d); setPadding(0, dp(10), 0, dp(10)); l.addView(this) }
         val name = field("Device name", "name", Build.MODEL); val pin = field("Shared PIN (same on both devices)", "pin", ""); val port = field("Port", "port", "45455", true)
-        val rec = field("Keep reconnecting for (seconds)", "reconnect_s", "300", true); val idle = field("Quit when idle, in minutes (0 = never)", "idle_min", "3", true)
+        val rec = field("Keep reconnecting for (seconds)", "reconnect_s", "900", true); val idle = field("Quit when idle, in minutes (0 = never)", "idle_min", "3", true)
         val auto = sw("Auto-accept everything", "auto", false); val vis = sw("Visible to nearby devices", "visible", true); val bg = sw("Receive in background", "bg", true)
         l.addView(tv("Receiving into: " + savePathText(), 14f, C.muted).apply { setPadding(0, dp(12), 0, dp(4)) })
         l.addView(Button(this).apply { text = "Reset to default folder"; setOnClickListener { p.edit().remove("tree").apply(); savePath.text = savePathText(); text = "Reset" } })
         l.addView(Button(this).apply { text = "Clear trusted devices (${Core.trusted().size})"; setOnClickListener { p.edit().remove("trusted").apply(); text = "Cleared" } })
+        l.addView(Button(this).apply { text = if (batteryOk()) "Background activity: allowed" else "Allow background activity (keeps transfers running with the screen off)"; setOnClickListener { requestBattery() } })
         l.addView(Button(this).apply { text = "Clear transfer cache (${size(Core.cacheBytes())})"; setOnClickListener { clearCacheUi(); text = "Cache now: ${size(Core.cacheBytes())}" } })
         dlg().setTitle("Settings").setView(ScrollView(this).apply { addView(l) }).setPositiveButton("Save") { _, _ ->
             val portChanged = port.text.toString() != Core.cfg("port", "45455")
             p.edit().putString("name", name.text.toString()).putString("pin", pin.text.toString()).putString("port", port.text.toString().ifEmpty { "45455" })
-                .putString("reconnect_s", rec.text.toString().ifEmpty { "300" }).putString("idle_min", idle.text.toString().ifEmpty { "3" })
+                .putString("reconnect_s", rec.text.toString().ifEmpty { "900" }).putString("idle_min", idle.text.toString().ifEmpty { "3" })
                 .putBoolean("auto", auto.isChecked).putBoolean("visible", vis.isChecked).putBoolean("bg", bg.isChecked).apply()
             subv.text = subtitle()
             if (bg.isChecked) startForegroundService(Intent(this, ReceiverService::class.java)) else stopService(Intent(this, ReceiverService::class.java))

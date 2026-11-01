@@ -4,6 +4,8 @@
   receiver-> "NO\\n" | "ERR msg\\n" | "OK\\n" {"off":{id:bytes_already_have}}\\n   (resume point per file)
   sender  -> for each file: bytes[off:size] then sha256(whole file) hex line
   receiver-> "DONE\\n" | "ERR msg\\n"       ("ERR paused" = the receiving user paused; the sender waits)
+Reverse connection (works even if the receiver's firewall blocks incoming connections): the RECEIVER opens the connection with
+  "HSHR\n" {name,port,os,pin}\n  and the other side answers either "HSHN\n" (nothing to send) or starts a normal "HSH3" send on that same connection.
 Partial files stay in <folder>/.hotshare/<id>.part so a dropped link, a pause or a power cut resumes where it stopped.
 Interrupted sends are saved as jobs (jobs.json) so they can be resumed after a restart.
 """
@@ -12,15 +14,20 @@ import hashlib, hmac, json, os, platform, queue, re, shutil, socket, threading, 
 HOME = os.path.expanduser("~")
 CFG_PATH = os.path.join(HOME, ".hotshare", "config.json")
 DEF = {"name": socket.gethostname(), "folder": os.path.join(HOME, "Downloads", "HotShare"), "port": 45455, "pin": "", "auto": False, "theme": "Midnight",
-       "visible": True, "open_after": False, "retries": 3, "reconnect_s": 300, "trusted": [], "history": []}
+       "visible": True, "open_after": False, "retries": 3, "reconnect_s": 900, "trusted": [], "history": []}
 DISC, BUF, MAXH = 45454, 1 << 20, 16 << 20
 _lock = threading.Lock()
-APPROVED, PAUSED, CANCELLED = {}, set(), {}     # approval memory per transfer (so reconnects never re-prompt) / transfers the receiving user paused
+APPROVED, PAUSED, CANCELLED = {}, set(), {}
+FINISHED, FINALIZING = {}, set()   # per transfer: file ids already saved (a reconnect never resends them) / ids being moved into place right now     # approval memory per transfer (so reconnects never re-prompt) / transfers the receiving user paused
 
 
 class Paused(Exception): """Paused by the user; partial data is kept."""
 class PeerPaused(Exception): """The receiver paused this transfer."""
 class ConnectionLost(Exception): """Could not reconnect within the reconnect window; resumable."""
+class Unreachable(ConnectionRefusedError): """Nobody answered on the first attempt (closed app, wrong network, or a firewall)."""
+
+
+HINT = "Could not reach {host}. Check that HotShare is open there and both devices are on the same network. If it is a Windows PC, allow HotShare in Windows Firewall (HotShare on the PC > Settings > Fix Windows Firewall)."
 
 
 def load_cfg():
@@ -142,6 +149,7 @@ def clear_cache(root, jobs=True):
         os.rmdir(d)
     except OSError: pass
     if jobs: _write_jobs([])
+    FINISHED.clear()
     return n
 
 
@@ -188,8 +196,8 @@ def readline(r, limit=65536):
 
 # ---------- receive (network reader + disk/hash writer run in parallel) ----------
 class _Writer(threading.Thread):
-    def __init__(s, ctl, dest):
-        super().__init__(daemon=True); s.q, s.err, s.ctl, s.dest, s.f, s.md = queue.Queue(maxsize=8), None, ctl, dest, None, None
+    def __init__(s, ctl, dest, key):
+        super().__init__(daemon=True); s.q, s.err, s.ctl, s.dest, s.f, s.md, s.key = queue.Queue(maxsize=8), None, ctl, dest, None, None, key
 
     def put(s, m):
         while True:
@@ -210,9 +218,13 @@ class _Writer(threading.Thread):
                     s.f = open(lp(part), "ab", buffering=0)
                 elif k == "data": s.f.write(m[1]); s.md.update(m[1])
                 elif k == "fin":
-                    _, expected, part, rel, size, idx = m; s.f.close(); s.f = None
+                    _, expected, part, rel, size, idx, fid_ = m; s.f.close(); s.f = None
                     if expected != s.md.hexdigest(): _rm(part); raise IOError(f"checksum mismatch: {rel}")
-                    final = unique(safe_path(s.dest, rel)); os.makedirs(lp(os.path.dirname(final)), exist_ok=True); move_retry(part, final)
+                    FINALIZING.add(fid_)
+                    try:
+                        final = unique(safe_path(s.dest, rel)); os.makedirs(lp(os.path.dirname(final)), exist_ok=True); move_retry(part, final)
+                        FINISHED.setdefault(s.key, set()).add(fid_)          # from now on a reconnecting sender skips this file entirely
+                    finally: FINALIZING.discard(fid_)
                     c = s.ctl; c.fdone[idx] = size; c.got += 1; c.log(f"Received {rel} ({hsize(size)})"); c.hist("in", rel, size, c._peer)
         except BaseException as e: s.err = e
         finally:
@@ -226,9 +238,9 @@ class _Writer(threading.Thread):
         s.join(15)
 
 
-def handle(sock, ctl):
-    r = sock.makefile("rb", BUF)
-    try: _handle(sock, ctl, r)
+def handle(sock, ctl, r=None, first=None):
+    r = r or sock.makefile("rb", BUF)
+    try: _handle(sock, ctl, r, first)
     finally:   # always tear the connection down NOW: a lingering half-open socket makes the other side wait and keeps partial files locked
         try: sock.shutdown(socket.SHUT_RDWR)
         except OSError: pass
@@ -236,9 +248,12 @@ def handle(sock, ctl):
         except OSError: pass
 
 
-def _handle(sock, ctl, r):
-    cfg = ctl.cfg; sock.settimeout(45); tune(sock)
-    first = readline(r)
+def _handle(sock, ctl, r, first=None):
+    cfg = ctl.cfg; sock.settimeout(120); tune(sock)
+    if first is None: first = readline(r)
+    if first == b"HSHN": return                       # reverse poll: the other side has nothing for us
+    if first == b"HSHR":                              # someone asks us to send: we are not a sender in this app
+        readline(r); sock.sendall(b"HSHN\n"); return
     if first == b"HSH?":   # discovery over the transfer port (works where UDP broadcast is blocked)
         if cfg.get("visible", True): sock.sendall(json.dumps({"name": cfg["name"], "port": cfg["port"], "os": platform.system()}).encode() + b"\n")
         return
@@ -262,26 +277,32 @@ def _handle(sock, ctl, r):
         ctl.declined = True; sock.sendall(b"NO\n"); ctl.log(f"Declined transfer from {peer}"); return
     APPROVED[key] = (time.time(), root)
     dest = safe_dir(root, h.get("dest", "")); pdir = os.path.join(root, ".hotshare"); os.makedirs(lp(pdir), exist_ok=True)
+    t0 = time.time()
+    while any(f.get("id") in FINALIZING for f in files) and time.time() - t0 < 900: time.sleep(.2)    # an earlier connection is still saving a big file: let it finish
+    fin = FINISHED.get(key, set()) & {f.get("id") for f in files}
     offs, parts = {}, {}
     for f in files:
-        if f.get("t") != "file": continue
+        if f.get("t") != "file" or f["id"] in fin: continue
         p = os.path.join(pdir, re.sub(r"[^0-9A-Za-z]", "", str(f["id"]))[:40] + ".part"); parts[f["id"]] = p
         n = os.path.getsize(lp(p)) if os.path.exists(lp(p)) else 0
         if n > f["size"]: _rm(p); n = 0
         offs[f["id"]] = n
     ctl.parts = list(parts.values())
-    if shutil.disk_usage(root).free < total - sum(offs.values()):
+    total_left = sum(f["size"] for f in files if f.get("t") == "file" and f["id"] not in fin)
+    if shutil.disk_usage(root).free < total_left - sum(offs.values()):
         sock.sendall(b"ERR not enough free space\n"); raise IOError("not enough free space")
-    sock.sendall(b"OK\n" + json.dumps({"off": offs}).encode() + b"\n")
-    done = sum(offs.values()); ctl.start(done)
+    sock.sendall(b"OK\n" + json.dumps({"off": offs, "done": sorted(fin)}).encode() + b"\n")
+    done = sum(offs.values()) + sum(f["size"] for f in files if f.get("t") == "file" and f["id"] in fin); ctl.start(done)
     ctl.set_files([f["path"] if f["t"] == "file" else "Text message" for f in files], [f.get("size", 0) for f in files])
     for ix, f in enumerate(files):
-        if f["t"] == "file": ctl.fdone[ix] = offs[f["id"]]
-    w = _Writer(ctl, dest); w.start()
+        if f["t"] == "file": ctl.fdone[ix] = f["size"] if f["id"] in fin else offs[f["id"]]
+        elif f["id"] in fin: ctl.fdone[ix] = ctl.sizes[ix]
+    w = _Writer(ctl, dest, key); w.start()
     try:
         for idx, f in enumerate(files):
+            if f["id"] in fin: continue
             if f.get("t") == "text":
-                txt = str(f.get("text", ""))[:1_000_000]; ctl.text(peer, txt); ctl.hist("in", "text", len(txt.encode()), peer); ctl.fdone[idx] = ctl.sizes[idx]; continue
+                txt = str(f.get("text", ""))[:1_000_000]; ctl.text(peer, txt); ctl.hist("in", "text", len(txt.encode()), peer); ctl.fdone[idx] = ctl.sizes[idx]; FINISHED.setdefault(key, set()).add(f["id"]); continue
             rel, size, off, part = f["path"], f["size"], offs[f["id"]], parts[f["id"]]
             if off: ctl.log(f"Resuming {rel} from {hsize(off)}")
             w.put(("start", part, off)); left = size - off
@@ -289,10 +310,10 @@ def _handle(sock, ctl, r):
                 b = r.read(min(BUF, left))
                 if not b: raise ConnectionError("connection lost")
                 left -= len(b); done += len(b); ctl.fdone[idx] = size - left; w.put(("data", b)); ctl.tick(done, total)
-            w.put(("fin", readline(r).decode(), part, rel, size, idx))
+            w.put(("fin", readline(r).decode(), part, rel, size, idx, f["id"]))
         w.finish()
         if w.err: raise w.err
-        sock.sendall(b"DONE\n"); ctl.progress(total, total, 0, 0)
+        sock.sendall(b"DONE\n"); ctl.progress(total, total, 0, 0); FINISHED.pop(key, None)
         try: os.rmdir(pdir)      # nothing left in the cache: remove the folder too
         except OSError: pass
     except BaseException as e:
@@ -331,7 +352,7 @@ def collect(paths):
 def text_item(txt): return {"t": "text", "text": txt, "rel": "text", "size": len(txt.encode())}
 
 
-def _producer(items, offs, q, stop):
+def _producer(items, offs, dones, q, stop):
     def put(m):
         while not stop.is_set():
             try: q.put(m, timeout=.5); return
@@ -339,7 +360,7 @@ def _producer(items, offs, q, stop):
     try:
         for ix, it in enumerate(items):
             if stop.is_set(): return
-            if it["t"] == "text": put(("skip", ix)); continue
+            if it["t"] == "text" or it["id"] in dones: put(("skip", ix)); continue
             off, md = min(max(int(offs.get(it["id"], 0)), 0), it["size"]), hashlib.sha256()
             with open(lp(it["abs"]), "rb", buffering=0) as f:
                 left = off
@@ -359,6 +380,19 @@ def _producer(items, offs, q, stop):
 
 
 def send_once(host, port, items, ctl, dest=""):
+    ctl.set_state("connecting", "Connecting...")
+    s = socket.create_connection((host, port), 10); tune(s); s.settimeout(180); r = s.makefile("rb", BUF)   # long: the receiver may be waiting for a tap on Accept
+    try: _send_over(s, r, items, ctl, dest, host)
+    finally:
+        try: s.shutdown(socket.SHUT_RDWR)
+        except OSError: pass
+        try: r.close()
+        except OSError: pass
+        s.close()
+
+
+def _send_over(s, r, items, ctl, dest, host):
+    """The sender side of HSH3 on an already-connected socket (used for normal sends and for reverse connections)."""
     cfg, man, total, seen, uniq = ctl.cfg, [], 0, set(), []
     for it in items:   # the same file picked twice would corrupt resume bookkeeping
         k = fid(it["rel"], it["size"], it["mtime"]) if it["t"] == "file" else None
@@ -369,8 +403,6 @@ def send_once(host, port, items, ctl, dest=""):
         else:
             it["id"] = fid(it["rel"], it["size"], it["mtime"]); total += it["size"]
             man.append({"id": it["id"], "t": "file", "path": it["rel"].replace("\\", "/"), "size": it["size"]})
-    ctl.set_state("connecting", "Connecting...")
-    s = socket.create_connection((host, port), 10); tune(s); s.settimeout(180); r = s.makefile("rb", BUF)   # long: the receiver may be waiting for a tap on Accept
     stop = threading.Event(); th = None
     try:
         s.sendall(b"HSH3\n" + json.dumps({"name": cfg["name"], "pin": cfg["pin"], "dest": dest, "files": man}).encode() + b"\n")
@@ -379,12 +411,13 @@ def send_once(host, port, items, ctl, dest=""):
             msg = resp[4:].decode("utf-8", "replace")
             raise PeerPaused(msg) if msg == "paused" else PermissionError(msg)
         if resp != b"OK": raise PermissionError("Receiver declined (or PIN mismatch)")
-        ctl.connected = True; s.settimeout(60); ctl.set_state("running", "")
-        offs = json.loads(readline(r, MAXH))["off"]; done = sum(offs.values()); ctl.start(done)
+        ctl.connected = True; s.settimeout(300); ctl.set_state("running", "")
+        reply = json.loads(readline(r, MAXH)); offs, dones = reply["off"], set(reply.get("done", []))
+        done = sum(offs.values()) + sum(it["size"] for it in items if it["t"] == "file" and it["id"] in dones); ctl.start(done)
         ctl.set_files(["Text message" if it["t"] == "text" else it["rel"] for it in items], [it["size"] for it in items])
         for ix, it in enumerate(items):
-            if it["t"] == "file": ctl.fdone[ix] = min(max(int(offs.get(it["id"], 0)), 0), it["size"])
-        q = queue.Queue(maxsize=8); th = threading.Thread(target=_producer, args=(items, offs, q, stop), daemon=True); th.start()
+            if it["t"] == "file": ctl.fdone[ix] = it["size"] if it["id"] in dones else min(max(int(offs.get(it["id"], 0)), 0), it["size"])
+        q = queue.Queue(maxsize=8); th = threading.Thread(target=_producer, args=(items, offs, dones, q, stop), daemon=True); th.start()
         while True:
             m = q.get(); k = m[0]
             if k == "end": break
@@ -394,6 +427,7 @@ def send_once(host, port, items, ctl, dest=""):
             elif k == "start": ctl.fdone[ix] = m[2]
             elif k == "data": s.sendall(m[2]); done += len(m[2]); ctl.fdone[ix] += len(m[2]); ctl.tick(done, total)
             elif k == "hash": s.sendall(m[2].encode() + b"\n"); ctl.fdone[ix] = items[ix]["size"]
+        s.settimeout(1800)       # the receiver may spend minutes moving / virus-scanning a big file before it says DONE: that is NOT a dead connection
         res = readline(r).decode()
         if res == "ERR paused": raise PeerPaused("paused")
         if res != "DONE": raise IOError(res or "no reply")
@@ -402,11 +436,22 @@ def send_once(host, port, items, ctl, dest=""):
     finally:
         stop.set()
         if th: th.join(3)
-        try: s.shutdown(socket.SHUT_RDWR)
-        except OSError: pass
-        try: r.close()
-        except OSError: pass
-        s.close()
+
+
+def poll(host, port, cfg, timeout=.8):
+    """Reverse connection: ask a device whether it has something for us (this also tells it who we are, so it can list us even when our
+    firewall blocks its scans). Returns (sock, reader, first_line) when it starts sending, else None."""
+    s = None
+    try:
+        s = socket.create_connection((host, port), timeout); tune(s); s.settimeout(timeout + 5); r = s.makefile("rb", BUF)
+        s.sendall(b"HSHR\n" + json.dumps({"name": cfg["name"], "port": cfg["port"], "os": platform.system(), "pin": cfg["pin"]}).encode() + b"\n")
+        first = readline(r)
+        if first == b"HSHN": raise EOFError("nothing pending")
+        return s, r, first
+    except Exception:
+        try: s.close()
+        except Exception: pass
+        return None
 
 
 def _wait(ctl, secs):
@@ -435,8 +480,8 @@ def send(host, port, items, ctl, dest=""):
         except (PermissionError, InterruptedError, Paused): raise
         except PeerPaused:
             ctl.set_state("waiting", "Paused by the receiver - waiting for it to resume"); _wait(ctl, 2)
-        except (ConnectionRefusedError, socket.gaierror) as e:
-            if attempt == 0 and not ctl.moved: raise
+        except (ConnectionRefusedError, socket.gaierror, socket.timeout) as e:
+            if attempt == 0 and not ctl.moved and not ctl.connected: raise Unreachable(HINT.format(host=ctl.label or host))
             attempt, deadline = _retry(ctl, attempt, deadline, e)
         except (OSError, EOFError) as e:
             attempt, deadline = _retry(ctl, attempt, deadline, e)

@@ -76,3 +76,37 @@ def clipboard_files():
         finally: u32.CloseClipboard()
     except Exception:
         return []
+
+
+# ---------- Windows Firewall: the usual reason a phone can't find or reach this PC ----------
+RULE = "HotShare"
+
+
+def exe_path():
+    import sys
+    return os.path.abspath(sys.executable)
+
+
+def _netsh(*args):
+    import subprocess
+    return subprocess.run(["netsh", "advfirewall", "firewall", *args], capture_output=True, text=True, timeout=10, creationflags=0x08000000)   # no console window
+
+
+def firewall_ok():
+    """True if an inbound allow rule for this program exists (or we cannot tell: then we do not nag)."""
+    if not IS_WIN: return True
+    try:
+        r = _netsh("show", "rule", f"name={RULE}", "verbose")
+        return r.returncode == 0 and exe_path().lower() in (r.stdout or "").lower()
+    except Exception:
+        return True
+
+
+def fix_firewall():
+    """Replace any (possibly blocking) rules for this program by one inbound allow rule for ALL networks. Shows ONE Windows approval prompt."""
+    if not IS_WIN: return False
+    exe = exe_path()
+    cmd = (f'netsh advfirewall firewall delete rule name=all program="{exe}" & netsh advfirewall firewall delete rule name="{RULE}" & '
+           f'netsh advfirewall firewall add rule name="{RULE}" dir=in action=allow program="{exe}" enable=yes profile=any')
+    try: return ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", f"/c {cmd}", None, 0) > 32
+    except Exception: return False

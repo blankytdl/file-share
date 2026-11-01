@@ -13,16 +13,19 @@ def lerp(a, b, t):
     return "#%02x%02x%02x" % tuple(int(x[i] + (y[i] - x[i]) * t) for i in range(3))
 
 
+def _lum(h): r, g, b = (int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)); return .2126 * r + .7152 * g + .0722 * b
+
+
 def _mk(bg, a1, a2, dark=True):
     if dark:
         t = dict(dark=True, bg=bg, side=lerp(bg, "#ffffff", .03), card=lerp(bg, "#ffffff", .075), card2=lerp(bg, "#ffffff", .15), track=lerp(bg, "#ffffff", .17), text="#e8edf5", muted="#8d99ab", ok="#38d39f", err="#ff6b6b", warn="#f5b84b")
     else:
         t = dict(dark=False, bg=bg, side=lerp(bg, "#000000", .035), card="#ffffff", card2=lerp(bg, "#000000", .07), track=lerp(bg, "#000000", .11), text="#1b2430", muted="#66728a", ok="#12a37a", err="#d94646", warn="#b97800")
-    t.update(accent=a1, accent2=a2, hover=lerp(t["card"], a1, .12), line=lerp(bg, t["text"], .12)); return t
+    t.update(on_accent="#000000" if _lum(a1) > .6 else "#ffffff", accent=a1, accent2=a2, hover=lerp(t["card"], a1, .12), line=lerp(bg, t["text"], .12)); return t
 
 
-THEME_ORDER = ["Midnight", "Crimson", "Ocean", "Emerald", "Sunset", "Orchid", "Daylight"]
-THEMES = {"Midnight": _mk("#0f1419", "#4c8dff", "#7c5cff"), "Crimson": _mk("#150b0d", "#ff4d5e", "#ff7a45"), "Ocean": _mk("#0a1620", "#22d3ee", "#3b82f6"), "Emerald": _mk("#0c1713", "#34d399", "#22c55e"),
+THEME_ORDER = ["Midnight", "Crimson", "Redline", "Mono Dark", "Mono Light", "Ocean", "Emerald", "Sunset", "Orchid", "Daylight"]
+THEMES = {"Midnight": _mk("#0f1419", "#4c8dff", "#7c5cff"), "Crimson": _mk("#150b0d", "#ff4d5e", "#ff7a45"), "Redline": _mk("#000000", "#ff2a2a", "#b30000"), "Mono Dark": _mk("#000000", "#ffffff", "#9a9a9a"), "Mono Light": _mk("#ececec", "#111111", "#555555", False), "Ocean": _mk("#0a1620", "#22d3ee", "#3b82f6"), "Emerald": _mk("#0c1713", "#34d399", "#22c55e"),
           "Sunset": _mk("#181110", "#fb923c", "#f43f5e"), "Orchid": _mk("#130f1d", "#c084fc", "#ec4899"), "Daylight": _mk("#eef2f8", "#2f6df0", "#6a4ce0", False)}
 P, SC, FONT, BUSY = {}, [1.0], ["Segoe UI"], [False]   # BUSY: a transfer is running -> keep animations light so they never compete with it
 
@@ -64,7 +67,7 @@ class RBtn(tk.Canvas):
         h, ic, gap = px(h), px(18), (px(8) if icon and text else 0); content = (ic if icon else 0) + gap + tw
         w = px(w) if w else (content + px(30) if text else h)
         super().__init__(parent, width=w, height=h, bg=parent["bg"], highlightthickness=0, cursor="hand2")
-        s.base = P["accent"] if primary else P["card2"]; s.col = s.base; s.fg = "#ffffff" if primary else P["text"]
+        s.base = P["accent"] if primary else P["card2"]; s.col = s.base; s.fg = P["on_accent"] if primary else P["text"]
         s.shape = rrect(s, 1, 1, w - 1, h - 1, h / 2.4, fill=s.col, outline=""); x = (w - content) / 2   # icon+label centred as one group
         if icon: draw_tk(s, icon, x, (h - ic) / 2, ic, s.fg)
         if text: s.create_text(x + (ic + gap if icon else 0), h / 2, text=text, fill=s.fg, anchor="w", font=F(10, True))
@@ -299,7 +302,7 @@ def main():
         root.after(25, pump)
 
     def toast(msg):
-        t = tk.Label(root, text=msg, bg=P["accent"], fg="#ffffff", font=F(10, True), padx=px(22), pady=px(10))
+        t = tk.Label(root, text=msg, bg=P["accent"], fg=P["on_accent"], font=F(10, True), padx=px(22), pady=px(10))
         def mv(i, up):
             if not t.winfo_exists(): return
             e = 1 - (1 - i / 10) ** 3; t.place(relx=.5, rely=1.0, anchor="s", y=int(px(60) - px(100) * e if up else -px(40) + px(100) * e))
@@ -496,27 +499,63 @@ def main():
         ui(dlg); ev.wait(120)
         return (out[0] if out else None), folder[0]
 
+    def serve(c, r=None, first=None):
+        ctl = new_ctl("Incoming", True)
+        try:
+            H.handle(c, ctl, r, first)
+            if not ctl.silent and ctl.label != "Incoming":
+                ui(finish, ctl, "fail" if ctl.declined else "ok", "Declined" if ctl.declined else (f"received {ctl.got} file(s)" if ctl.got else "text received"))
+        except H.Paused: ui(finish, ctl, "paused", "partial data kept. Press Resume and the sender continues")
+        except InterruptedError: ui(finish, ctl, "cancelled", "cancelled; cached data discarded")
+        except Exception as e:
+            if ctl.label != "Incoming" and not ctl.silent: ui(finish, ctl, "fail", f"{e} - partial data kept, the sender reconnects on its own")
+        finally:
+            try: c.close()
+            except OSError: pass
+            active.remove(ctl); BUSY[0] = bool(active); H.save_cfg(cfg); ui(update_speed)
+
     def server():
         try:
             s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20); s.bind(("", cfg["port"])); s.listen(32)
         except Exception as e: return ui(toast, f"Cannot receive: {e} (is the port already in use?)")
         while True:
-            c, _ = s.accept()
-            def run(c=c):
-                ctl = new_ctl("Incoming", True)
-                try:
-                    H.handle(c, ctl)
-                    if not ctl.silent and ctl.label != "Incoming":
-                        ui(finish, ctl, "fail" if ctl.declined else "ok", "Declined" if ctl.declined else (f"received {ctl.got} file(s)" if ctl.got else "text received"))
-                except H.Paused: ui(finish, ctl, "paused", "partial data kept. Press Resume and the sender continues")
-                except InterruptedError: ui(finish, ctl, "cancelled", "cancelled; cached data discarded")
-                except Exception as e:
-                    if ctl.label != "Incoming" and not ctl.silent: ui(finish, ctl, "fail", f"{e} - partial data kept, the sender reconnects on its own")
-                finally:
-                    try: c.close()
-                    except OSError: pass
-                    active.remove(ctl); BUSY[0] = bool(active); H.save_cfg(cfg); ui(update_speed)
-            threading.Thread(target=run, daemon=True).start()
+            c, _ = s.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
+
+    def poll_loop():
+        """Reverse connections. We can always reach the phone, even when our firewall hides us from it. Every few seconds we knock on each phone:
+        it learns who we are (so it lists this PC) and, if it has files for us, sends them over the connection WE opened."""
+        while True:
+            time.sleep(5)
+            for ip, (nm, port, os_) in list(devices.items()):
+                if os_ in ("Windows", "Linux", "Darwin"): continue
+                got = H.poll(ip, port, cfg)
+                if got: threading.Thread(target=serve, args=got, daemon=True).start()
+
+    # ---- Windows Firewall: the usual reason a phone cannot find / reach this PC ----
+    fw_state = {"asked": False}
+    def ask_fw():
+        d = dialog("Allow HotShare through Windows Firewall"); Icon(d, "radar", 34, P["warn"]).pack(pady=(px(20), px(6)))
+        label(d, "Phones can't find or send to this PC", 14, True, P["text"]).pack(padx=px(30))
+        label(d, "Windows Firewall is blocking incoming connections for HotShare\n(often on hotspot / 'Public' networks). One click fixes it.", 10, justify="center").pack(padx=px(30), pady=px(8))
+        row = tk.Frame(d, bg=P["bg"]); row.pack(pady=px(18))
+        RBtn(row, "Allow now", lambda: (d.destroy(), do_fw_fix()), primary=True, icon="check", w=130).pack(side="left", padx=px(6)); RBtn(row, "Later", d.destroy, w=100).pack(side="left", padx=px(6))
+        cfg["fw_asked"] = WIN.exe_path(); H.save_cfg(cfg)
+
+    def set_fw(ok_):
+        row = W.get("fwrow")
+        if row is None or not row.winfo_exists(): return
+        if ok_: row.pack_forget()
+        else:
+            row.pack(fill="x", padx=px(26), pady=(px(10), 0), after=W["strip"])
+            if not fw_state["asked"] and cfg.get("fw_asked") != WIN.exe_path(): fw_state["asked"] = True; ask_fw()
+
+    def check_fw():
+        if WIN.IS_WIN: threading.Thread(target=lambda: ui(set_fw, WIN.firewall_ok()), daemon=True).start()
+
+    def do_fw_fix():
+        if WIN.fix_firewall(): toast("Approve the Windows prompt - then phones can find and send to this PC"); root.after(6000, check_fw); root.after(16000, check_fw)
+        else: toast("Could not open the Windows prompt. Allow HotShare in Windows Security > Firewall > Allow an app.")
+
 
     def send_queue():
         t = [(ip, devices[ip][1], devices[ip][0]) for ip in selected if ip in devices]
@@ -593,7 +632,8 @@ def main():
             except ValueError: return toast("Port and reconnect time must be numbers")
             cfg.update(name=v["name"].get(), folder=v["folder"].get(), port=port, pin=v["pin"].get(), reconnect_s=max(10, rs), **{k: b[k].get() for k in b})
             os.makedirs(cfg["folder"], exist_ok=True); H.save_cfg(cfg); W["path"].configure(text=short(cfg["folder"], 30)); w.destroy(); toast("Saved (restart to apply a new port)")
-        RBtn(w, "Save", ok, primary=True, icon="check").grid(row=10, column=1, pady=px(16), sticky="w")
+        if WIN.IS_WIN: RBtn(w, "Fix Windows Firewall (phones can't find this PC)", do_fw_fix, h=30, icon="check").grid(row=10, column=1, sticky="w", pady=px(8))
+        RBtn(w, "Save", ok, primary=True, icon="check").grid(row=11, column=1, pady=px(16), sticky="w")
 
     def set_theme(name):
         if name == cfg["theme"]: return
@@ -636,9 +676,10 @@ def main():
         sf = ScrollFrame(side); sf.pack(fill="both", expand=True, padx=px(14)); W["devbox"] = sf.inner
 
         # --- sidebar: footer (themes + history/settings) ---
-        sw = tk.Frame(foot, bg=P["side"]); sw.pack(fill="x", pady=(0, px(12)))
-        for name in THEME_ORDER:
-            c = tk.Canvas(sw, width=px(26), height=px(26), bg=P["side"], highlightthickness=0, cursor="hand2"); a = THEMES[name]["accent"]
+        sw = tk.Frame(foot, bg=P["side"]); sw.pack(fill="x", pady=(0, px(12))); swrows = [tk.Frame(sw, bg=P["side"]) for _ in range(2)]
+        for fr_ in swrows: fr_.pack(anchor="w")
+        for k, name in enumerate(THEME_ORDER):
+            c = tk.Canvas(swrows[k // 5], width=px(26), height=px(26), bg=P["side"], highlightthickness=0, cursor="hand2"); a = THEMES[name]["accent"]
             c.create_oval(px(5), px(5), px(21), px(21), fill=a, outline="")
             if name == cfg["theme"]: c.create_oval(px(2), px(2), px(24), px(24), outline=P["text"], width=2)
             c.bind("<Button-1>", lambda e, n=name: set_theme(n)); c.pack(side="left", padx=px(2))
@@ -656,6 +697,10 @@ def main():
         dot.create_oval(1, 1, px(10) - 1, px(10) - 1, fill=P["ok"], outline=""); dot.pack(side="left")
         tk.Label(st, text=f"Ready to receive   -   {', '.join(H.local_ips()[:1]) or 'no network'}:{cfg['port']}", bg=P["bg"], fg=P["muted"], font=F(9)).pack(side="left", padx=px(10))
         W["speed"] = tk.Label(st, text="Idle", bg=P["bg"], fg=P["text"], font=F(10, True)); W["speed"].pack(side="right")
+
+        W["strip"] = st; fwr = tk.Frame(mainf, bg=P["card"]); W["fwrow"] = fwr
+        tk.Label(fwr, text="Windows Firewall may be blocking phones from finding or sending to this PC.", bg=P["card"], fg=P["warn"], font=F(10, True)).pack(side="left", padx=px(16), pady=px(12))
+        RBtn(fwr, "Allow in Windows Firewall", do_fw_fix, h=32, primary=True, icon="check").pack(side="right", padx=px(12))
 
         # --- main: scrolling content ---
         sfm = ScrollFrame(mainf); sfm.pack(fill="both", expand=True); body = sfm.inner
@@ -690,7 +735,7 @@ def main():
             card = make_card(c)
             if c.names: card.set_files(c.names, c.sizes); card.update_files(c.fdone)
             if c.last[1]: on_prog(c, *c.last)
-        WIN.style_titlebar(root, P["bg"], P["text"], P["accent"], P["dark"])
+        WIN.style_titlebar(root, P["bg"], P["text"], P["accent"], P["dark"]); check_fw()
 
     def wheel(e):
         try: w = root.winfo_containing(e.x_root, e.y_root)
@@ -703,7 +748,10 @@ def main():
     root.bind_all("<Control-v>", lambda e: paste() if not isinstance(e.widget, (tk.Entry, tk.Text)) else None)
 
     build(); restore_jobs(); pump(); WIN.hook_dropfiles(root, lambda files: ui(add_paths, files))
-    threading.Thread(target=server, daemon=True).start(); threading.Thread(target=H.discovery_server, args=(cfg,), daemon=True).start()
+    def disc():
+        try: H.discovery_server(cfg)
+        except Exception as e: ui(toast, f"Device discovery is off: {e}")
+    threading.Thread(target=server, daemon=True).start(); threading.Thread(target=disc, daemon=True).start(); threading.Thread(target=poll_loop, daemon=True).start()
     refresh(); root.mainloop(); H.save_cfg(cfg)
 
 
