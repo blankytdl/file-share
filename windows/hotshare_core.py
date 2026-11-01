@@ -18,12 +18,17 @@ DEF = {"name": socket.gethostname(), "folder": os.path.join(HOME, "Downloads", "
 DISC, BUF, MAXH = 45454, 1 << 20, 16 << 20
 _lock = threading.Lock()
 APPROVED, PAUSED, CANCELLED = {}, set(), {}
+SKIP, BAD, LEGACY = {}, {}, set()   # per transfer: file ids the user cancelled / that could not be received / per-file strike count / peers whose sender ignores the "done" list
 FINISHED, FINALIZING = {}, set()   # per transfer: file ids already saved (a reconnect never resends them) / ids being moved into place right now     # approval memory per transfer (so reconnects never re-prompt) / transfers the receiving user paused
 
 
 class Paused(Exception): """Paused by the user; partial data is kept."""
 class PeerPaused(Exception): """The receiver paused this transfer."""
 class ConnectionLost(Exception): """Could not reconnect within the reconnect window; resumable."""
+class Rerun(Exception): """Drop this connection on purpose so the sender reconnects (a file was cancelled)."""
+class Desync(Exception):
+    """The other side's byte stream no longer matches the sizes it announced (older app version, or a file that changed size)."""
+    def __init__(s, msg, fid=None): super().__init__(msg); s.fid = fid
 class Unreachable(ConnectionRefusedError): """Nobody answered on the first attempt (closed app, wrong network, or a firewall)."""
 
 
@@ -44,6 +49,7 @@ def save_cfg(c):
 
 
 # ---------- file names that are safe on Windows (phones allow characters Windows refuses) ----------
+_HEX = re.compile(rb"[0-9a-f]{64}")
 _BAD = re.compile(r'[<>:"|?*\x00-\x1f]')
 _RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
@@ -149,7 +155,7 @@ def clear_cache(root, jobs=True):
         os.rmdir(d)
     except OSError: pass
     if jobs: _write_jobs([])
-    FINISHED.clear()
+    FINISHED.clear(); SKIP.clear(); BAD.clear()
     return n
 
 
@@ -173,10 +179,16 @@ class Ctl:
         s.cancel, s.pause = threading.Event(), threading.Event()
         s._t0 = s._last = s._base = 0; s.moved = s._seen = 0; s.key = None; s.parts = []; s.job = None; s.state = ""
         s.names, s.sizes, s.fdone, s.last, s.on_files = [], [], [], (0, 0, 0, 0), (lambda: None); s.on_state = lambda st, msg: None
+        s.fids, s.fstate, s.skip_req, s.gone, s.fsent = [], {}, set(), set(), set()   # per-file: ids / "skipped" rows / cancel requests / rows removed from the manifest / rows already fully sent
 
     def set_state(s, st, msg=""): s.state = st; s.on_state(st, msg)
     def set_files(s, names, sizes): s.names, s.sizes, s.fdone = list(names), list(sizes), [0] * len(names); s.on_files()
     def start(s, base=0): s._t0, s._last, s._base = time.monotonic(), 0, base
+
+    def cancel_file(s, ix):
+        """Skip ONE file of this transfer; the other files carry on. Returns False if that file is already finished."""
+        if not 0 <= ix < len(s.sizes) or ix in s.fstate or (s.sizes[ix] > 0 and s.fdone[ix] >= s.sizes[ix]) or ix in s.fsent: return False
+        s.skip_req.add(ix); s.fstate[ix] = "skipped"; s.progress(*s.last); return True
 
     def tick(s, done, total):
         if s.cancel.is_set(): raise InterruptedError("cancelled")
@@ -258,7 +270,7 @@ def _handle(sock, ctl, r, first=None):
         if cfg.get("visible", True): sock.sendall(json.dumps({"name": cfg["name"], "port": cfg["port"], "os": platform.system()}).encode() + b"\n")
         return
     if first != b"HSH3": return
-    h = json.loads(readline(r, MAXH)); peer = str(h.get("name", "?")); files = h["files"]; ctl.label = ctl._peer = peer
+    h = json.loads(readline(r, MAXH).decode("utf-8", "replace")); peer = str(h.get("name", "?")); files = h["files"]; ctl.label = ctl._peer = peer
     if len(files) > 200000: raise ValueError("too many files")
     for f in files:
         if f.get("t") not in ("file", "text") or (f["t"] == "file" and (not isinstance(f.get("size"), int) or f["size"] < 0)): raise ValueError("bad manifest")
@@ -279,10 +291,15 @@ def _handle(sock, ctl, r, first=None):
     dest = safe_dir(root, h.get("dest", "")); pdir = os.path.join(root, ".hotshare"); os.makedirs(lp(pdir), exist_ok=True)
     t0 = time.time()
     while any(f.get("id") in FINALIZING for f in files) and time.time() - t0 < 900: time.sleep(.2)    # an earlier connection is still saving a big file: let it finish
-    fin = FINISHED.get(key, set()) & {f.get("id") for f in files}
+    ids = {f.get("id") for f in files}; fin_ok = FINISHED.get(key, set()) & ids
+    skipped = (SKIP.get(key, set()) & ids) - fin_ok           # files the user cancelled (or that kept failing): the sender is told they are done
+    fin = fin_ok | skipped; legacy = peer in LEGACY            # legacy: this sender ignores the "done" list, so it must be told "I already hold every byte" instead
     offs, parts = {}, {}
     for f in files:
-        if f.get("t") != "file" or f["id"] in fin: continue
+        if f.get("t") != "file": continue
+        if f["id"] in fin:
+            if legacy: offs[f["id"]] = f["size"]
+            continue
         p = os.path.join(pdir, re.sub(r"[^0-9A-Za-z]", "", str(f["id"]))[:40] + ".part"); parts[f["id"]] = p
         n = os.path.getsize(lp(p)) if os.path.exists(lp(p)) else 0
         if n > f["size"]: _rm(p); n = 0
@@ -291,39 +308,62 @@ def _handle(sock, ctl, r, first=None):
     total_left = sum(f["size"] for f in files if f.get("t") == "file" and f["id"] not in fin)
     if shutil.disk_usage(root).free < total_left - sum(offs.values()):
         sock.sendall(b"ERR not enough free space\n"); raise IOError("not enough free space")
-    sock.sendall(b"OK\n" + json.dumps({"off": offs, "done": sorted(fin)}).encode() + b"\n")
-    done = sum(offs.values()) + sum(f["size"] for f in files if f.get("t") == "file" and f["id"] in fin); ctl.start(done)
-    ctl.set_files([f["path"] if f["t"] == "file" else "Text message" for f in files], [f.get("size", 0) for f in files])
+    sock.sendall(b"OK\n" + json.dumps({"off": offs, "done": [] if legacy else sorted(fin)}).encode() + b"\n")
+    total -= sum(f["size"] for f in files if f.get("t") == "file" and f["id"] in skipped)
+    done = sum(n for i, n in offs.items() if i in parts) + sum(f["size"] for f in files if f.get("t") == "file" and f["id"] in fin_ok); ctl.start(done)
+    ctl.set_files([f["path"] if f["t"] == "file" else "Text message" for f in files], [f.get("size", 0) for f in files]); ctl.fids = [f["id"] for f in files]
     for ix, f in enumerate(files):
-        if f["t"] == "file": ctl.fdone[ix] = f["size"] if f["id"] in fin else offs[f["id"]]
+        if f["id"] in skipped: ctl.fstate[ix] = "skipped"
+        elif f["t"] == "file": ctl.fdone[ix] = f["size"] if f["id"] in fin else offs[f["id"]]
         elif f["id"] in fin: ctl.fdone[ix] = ctl.sizes[ix]
+
+    def hashline(f):
+        """The checksum line after a file's bytes. Anything else means the stream is out of step - say so instead of crashing on binary data."""
+        b = r.readline(65)
+        if len(b) == 65 and b[64:] == b"\n" and _HEX.fullmatch(b[:64]): return b[:64].decode()
+        if not b: raise ConnectionError("connection lost")
+        raise Desync(f"out of sync at '{f['path']}': the sender's data does not match the size it announced", f["id"])
     w = _Writer(ctl, dest, key); w.start()
     try:
         for idx, f in enumerate(files):
-            if f["id"] in fin: continue
+            if f["id"] in fin:
+                if legacy and f.get("t") == "file": hashline(f)      # old sender: it still sends the checksum line of a file we already hold
+                continue
             if f.get("t") == "text":
                 txt = str(f.get("text", ""))[:1_000_000]; ctl.text(peer, txt); ctl.hist("in", "text", len(txt.encode()), peer); ctl.fdone[idx] = ctl.sizes[idx]; FINISHED.setdefault(key, set()).add(f["id"]); continue
             rel, size, off, part = f["path"], f["size"], offs[f["id"]], parts[f["id"]]
+            if idx in ctl.skip_req: raise Rerun(f"skipped {rel}")
             if off: ctl.log(f"Resuming {rel} from {hsize(off)}")
             w.put(("start", part, off)); left = size - off
             while left:
+                if idx in ctl.skip_req: raise Rerun(f"skipped {rel}")
                 b = r.read(min(BUF, left))
                 if not b: raise ConnectionError("connection lost")
                 left -= len(b); done += len(b); ctl.fdone[idx] = size - left; w.put(("data", b)); ctl.tick(done, total)
-            w.put(("fin", readline(r).decode(), part, rel, size, idx, f["id"]))
+            w.put(("fin", hashline(f), part, rel, size, idx, f["id"]))
         w.finish()
         if w.err: raise w.err
-        sock.sendall(b"DONE\n"); ctl.progress(total, total, 0, 0); FINISHED.pop(key, None)
+        sock.sendall(b"DONE\n"); ctl.progress(total, total, 0, 0); FINISHED.pop(key, None); SKIP.pop(key, None)
+        for k_ in [k_ for k_ in BAD if k_[0] == key]: BAD.pop(k_, None)
         try: os.rmdir(pdir)      # nothing left in the cache: remove the folder too
         except OSError: pass
     except BaseException as e:
         w.finish()
         if isinstance(e, InterruptedError): APPROVED.pop(key, None); CANCELLED[key] = time.time()
+        if isinstance(e, Rerun):      # the user cancelled file(s): remember them, drop their partial data, and let the sender reconnect without them
+            for ix in ctl.skip_req: SKIP.setdefault(key, set()).add(ctl.fids[ix])
+            for i in SKIP.get(key, ()): _rm(parts.get(i, ""))
+        elif isinstance(e, Desync):
+            if not legacy and any(f.get("t") == "file" and f["id"] in fin for f in files):    # first suspect: a sender that ignores the "done" list
+                LEGACY.add(peer); e = Desync(f"{e} - retrying in compatibility mode", e.fid)
+            else:                                                                           # same file went wrong twice: give up on that one file, keep the rest
+                BAD[(key, e.fid)] = BAD.get((key, e.fid), 0) + 1
+                if BAD[(key, e.fid)] >= 2: SKIP.setdefault(key, set()).add(e.fid); _rm(parts.get(e.fid, "")); e = Desync(f"{e} - that file was skipped, the rest continues", e.fid)
         try: sock.sendall(b"ERR paused\n" if isinstance(e, Paused) else f"ERR {e}\n".encode())
         except OSError: pass
         if ctl.discard:
             for p in parts.values(): _rm(p)
-        raise
+        raise e
 
 
 # ---------- send (disk reader + hasher and the network sender run in parallel) ----------
@@ -393,11 +433,9 @@ def send_once(host, port, items, ctl, dest=""):
 
 def _send_over(s, r, items, ctl, dest, host):
     """The sender side of HSH3 on an already-connected socket (used for normal sends and for reverse connections)."""
-    cfg, man, total, seen, uniq = ctl.cfg, [], 0, set(), []
-    for it in items:   # the same file picked twice would corrupt resume bookkeeping
-        k = fid(it["rel"], it["size"], it["mtime"]) if it["t"] == "file" else None
-        if k is None or k not in seen: uniq.append(it); seen.add(k)
-    items = uniq
+    cfg, man, total = ctl.cfg, [], 0
+    all_items = items; live = [(ox, it) for ox, it in enumerate(all_items) if ox not in ctl.gone]     # rows removed by a per-file cancel are not announced any more
+    items, omap = [it for _, it in live], [ox for ox, _ in live]
     for n, it in enumerate(items):
         if it["t"] == "text": man.append({"id": f"t{n}", "t": "text", "path": "text", "size": it["size"], "text": it["text"]})
         else:
@@ -414,19 +452,23 @@ def _send_over(s, r, items, ctl, dest, host):
         ctl.connected = True; s.settimeout(300); ctl.set_state("running", "")
         reply = json.loads(readline(r, MAXH)); offs, dones = reply["off"], set(reply.get("done", []))
         done = sum(offs.values()) + sum(it["size"] for it in items if it["t"] == "file" and it["id"] in dones); ctl.start(done)
-        ctl.set_files(["Text message" if it["t"] == "text" else it["rel"] for it in items], [it["size"] for it in items])
+        if len(ctl.names) != len(all_items): ctl.set_files(["Text message" if it["t"] == "text" else it["rel"] for it in all_items], [it["size"] for it in all_items])   # first connection only: later ones keep the rows
         for ix, it in enumerate(items):
-            if it["t"] == "file": ctl.fdone[ix] = it["size"] if it["id"] in dones else min(max(int(offs.get(it["id"], 0)), 0), it["size"])
+            if it["t"] == "file": ctl.fdone[omap[ix]] = it["size"] if it["id"] in dones else min(max(int(offs.get(it["id"], 0)), 0), it["size"])
         q = queue.Queue(maxsize=8); th = threading.Thread(target=_producer, args=(items, offs, dones, q, stop), daemon=True); th.start()
         while True:
             m = q.get(); k = m[0]
             if k == "end": break
             if k == "err": raise m[1]
-            ix = m[1]
-            if k == "skip": ctl.fdone[ix] = items[ix]["size"]
-            elif k == "start": ctl.fdone[ix] = m[2]
-            elif k == "data": s.sendall(m[2]); done += len(m[2]); ctl.fdone[ix] += len(m[2]); ctl.tick(done, total)
-            elif k == "hash": s.sendall(m[2].encode() + b"\n"); ctl.fdone[ix] = items[ix]["size"]
+            ix = m[1]; ox = omap[ix]
+            if k == "skip": ctl.fdone[ox] = items[ix]["size"]; ctl.fsent.add(ox)
+            elif k == "start":
+                if ox in ctl.skip_req: raise Rerun("file cancelled")
+                ctl.fdone[ox] = m[2]
+            elif k == "data":
+                if ox in ctl.skip_req: raise Rerun("file cancelled")
+                s.sendall(m[2]); done += len(m[2]); ctl.fdone[ox] += len(m[2]); ctl.tick(done, total)
+            elif k == "hash": s.sendall(m[2].encode() + b"\n"); ctl.fdone[ox] = items[ix]["size"]; ctl.fsent.add(ox)
         s.settimeout(1800)       # the receiver may spend minutes moving / virus-scanning a big file before it says DONE: that is NOT a dead connection
         res = readline(r).decode()
         if res == "ERR paused": raise PeerPaused("paused")
@@ -472,11 +514,26 @@ def _retry(ctl, attempt, deadline, e):
     return attempt, deadline
 
 
+def _dedupe(items):
+    """The same file picked twice would corrupt resume bookkeeping."""
+    seen, uniq = set(), []
+    for it in items:
+        k = fid(it["rel"], it["size"], it["mtime"]) if it["t"] == "file" else None
+        if k is None or k not in seen: uniq.append(it); seen.add(k)
+    return uniq
+
+
 def send(host, port, items, ctl, dest=""):
     """Sends everything; reconnects and resumes on its own for up to cfg['reconnect_s'] seconds. Raises Paused / ConnectionLost (resumable)."""
-    attempt, deadline = 0, None
+    attempt, deadline = 0, None; items = _dedupe(items)
     while True:
         try: return send_once(host, port, items, ctl, dest)
+        except Rerun:         # a file was cancelled: leave it (and everything already delivered) out and send the rest as a fresh, smaller transfer
+            for ox in ctl.skip_req: ctl.gone.add(ox)
+            ctl.skip_req.clear(); ctl.gone.update(ox for ox in ctl.fsent if ox < len(items))
+            if ctl.job: ctl.job["items"] = [it for ox, it in enumerate(items) if ox not in ctl.gone]; save_job(ctl.job)
+            if len(ctl.gone) >= len(items): ctl.progress(1, 1, 0, 0); return
+            attempt, deadline = 0, None
         except (PermissionError, InterruptedError, Paused): raise
         except PeerPaused:
             ctl.set_state("waiting", "Paused by the receiver - waiting for it to resume"); _wait(ctl, 2)

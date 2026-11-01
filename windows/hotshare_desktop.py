@@ -221,10 +221,10 @@ class QueueRow(RCard):
 
 
 class XCard(RCard):
-    MAXROWS = 40
+    MAXROWS = 80
 
-    def __init__(s, parent, title, up, on_cancel, on_pause):
-        super().__init__(parent, pad=14); i = s.inner; s.rows, s.sizes, s.open, s.cancel_cb, s.pause_cb, s.mode = [], [], False, on_cancel, on_pause, "run"
+    def __init__(s, parent, title, up, on_cancel, on_pause, on_file=None):
+        super().__init__(parent, pad=14); i = s.inner; s.rows, s.sizes, s.open, s.cancel_cb, s.pause_cb, s.mode, s.file_cb = [], [], False, on_cancel, on_pause, "run", on_file
         top = tk.Frame(i, bg=P["card"]); top.pack(fill="x")
         Icon(top, "upload" if up else "download", 22, P["accent"], P["card"]).pack(side="left")
         s.title = tk.Label(top, text=title, bg=P["card"], fg=P["text"], font=F(11, True)); s.title.pack(side="left", padx=(px(10), 0))
@@ -240,6 +240,8 @@ class XCard(RCard):
     def set_mode(s, mode):
         if mode == s.mode: return
         s.mode = mode
+        if mode != "run":
+            for r in s.rows: r["x"].pack_forget()          # per-file cancel only makes sense while the transfer runs
         if mode == "done": s.pbtn.pack_forget(); return
         s.pbtn.pack(side="right", padx=(0, px(12)))
         s.pbtn.show("play", P["ok"]) if mode == "paused" else s.pbtn.show("pause", P["text"])
@@ -253,8 +255,10 @@ class XCard(RCard):
             mid = tk.Frame(f, bg=P["card"]); mid.pack(side="left", fill="x", expand=True, padx=px(10))
             tk.Label(mid, text=short(names[k], 56), bg=P["card"], fg=P["text"], font=F(9), anchor="w").pack(anchor="w")
             bar = Bar(mid, h=5); bar.pack(fill="x", pady=(px(3), 0))
-            st = tk.Label(f, text="", bg=P["card"], fg=P["muted"], font=F(9), width=7, anchor="e"); st.pack(side="right")
-            s.rows.append(dict(ic=ic, bar=bar, st=st, last=-1, done=False))
+            x = Icon(f, "close", 14, P["muted"], P["card"]); x.configure(cursor="hand2"); x.bind("<Button-1>", lambda e, k=k: s.file_cb and s.file_cb(k))     # cancel just this file
+            if s.mode == "run" and s.file_cb: x.pack(side="right", padx=(px(6), 0))
+            st = tk.Label(f, text="", bg=P["card"], fg=P["muted"], font=F(9), width=8, anchor="e"); st.pack(side="right")
+            s.rows.append(dict(ic=ic, bar=bar, st=st, x=x, last=-1, done=False))
         if n > s.MAXROWS: tk.Label(s.fbox, text=f"... and {n - s.MAXROWS} more", bg=P["card"], fg=P["muted"], font=F(9)).pack(anchor="w", pady=px(4))
         s.open = n <= 4; s._show()
 
@@ -265,15 +269,19 @@ class XCard(RCard):
 
     def toggle(s): s.open = not s.open; s._show()
 
-    def update_files(s, fdone, all_done=False):
+    def update_files(s, fdone, all_done=False, fstate=None):
+        fstate = fstate or {}
         for k, r in enumerate(s.rows):
+            if k in fstate:                                  # cancelled by the user (or given up on): shown as skipped, never as an error
+                if r["last"] != -3: r["last"] = -3; r["bar"].set(0); r["st"].configure(text="Skipped", fg=P["warn"]); r["ic"].show("close", P["warn"]); r["x"].pack_forget()
+                continue
             size, d = s.sizes[k], (fdone[k] if k < len(fdone) else 0); done = all_done or (size > 0 and d >= size)
             key = -2 if done else (int(100 * d / size) if size else 0)
             if key == r["last"]: continue
             r["last"] = key
             if done:
                 r["bar"].set(1, True); r["st"].configure(text="Done", fg=P["ok"])
-                if not r["done"]: r["done"] = True; r["ic"].show("check", P["ok"])
+                if not r["done"]: r["done"] = True; r["ic"].show("check", P["ok"]); r["x"].pack_forget()
             else:
                 r["bar"].set(d / size if size else 0); r["st"].configure(text=f"{key}%" if size else "", fg=P["muted"])
 
@@ -387,18 +395,24 @@ def main():
     def title_of(c): return ("From " if c.incoming and c.label != "Incoming" else "") + c.label
 
     def make_card(c):
-        card = XCard(W["xbox"], title_of(c), not c.incoming, lambda: discard(c), lambda: toggle_pause(c)); card.pack(fill="x", pady=px(6)); cards[c] = card; return card
+        card = XCard(W["xbox"], title_of(c), not c.incoming, lambda: discard(c), lambda: toggle_pause(c), lambda k: cancel_file(c, k)); card.pack(fill="x", pady=px(6)); cards[c] = card; return card
+
+    def cancel_file(c, k):   # the small X on one file row: skip that file, the rest of the transfer carries on
+        if c in done_ or c not in active: return
+        if c.cancel_file(k): toast(f"Skipping {short(c.names[k], 40)}" + (" - reconnecting without it" if c.incoming or c.job else ""))
 
     def update_speed():
         if W.get("speed") is not None and W["speed"].winfo_exists():
             W["speed"].configure(text=f"{H.hsize(sum(c.last[2] for c in active if c.state not in ('waiting', 'reconnecting')))}/s   -   {len(active)} active" if active else "Idle")
 
     def on_files(c):
-        card = cards.get(c) or make_card(c); card.title.configure(text=title_of(c)); card.set_files(c.names, c.sizes)
+        card = cards.get(c) or make_card(c); card.title.configure(text=title_of(c)); card.set_files(c.names, c.sizes); card.update_files(c.fdone, fstate=c.fstate)
+        if c.incoming and c.key:     # a reconnect of the same transfer replaces its earlier "stopped" card instead of stacking a new one
+            for old in [o for o, (st, _) in done_.items() if o is not c and o.incoming and o.key == c.key and st != "paused"]: remove_card(old)
 
     def on_prog(c, d, t, sp, eta):
         card = cards.get(c) or make_card(c); card.title.configure(text=title_of(c)); card.bar.set(d / t if t else 0)
-        card.stat.configure(text=f"{H.hsize(d)} of {H.hsize(t)}   -   {H.hsize(sp)}/s   -   {int(eta)}s left" if sp else "Finishing...", fg=P["muted"]); card.update_files(c.fdone); update_speed()
+        card.stat.configure(text=f"{H.hsize(d)} of {H.hsize(t)}   -   {H.hsize(sp)}/s   -   {int(eta)}s left" if sp else "Finishing...", fg=P["muted"]); card.update_files(c.fdone, fstate=c.fstate); update_speed()
 
     def on_state(c, st, msg):
         card = cards.get(c) or make_card(c)
@@ -410,7 +424,7 @@ def main():
         if card is not None and card.winfo_exists(): card.destroy()
 
     def paint_done(card, c, state, msg):
-        ok = state == "ok"; card.title.configure(text=title_of(c)); card.bar.set(1 if ok else card.bar.cur, done=ok); card.update_files(c.fdone, all_done=ok)
+        ok = state == "ok"; card.title.configure(text=title_of(c)); card.bar.set(1 if ok else card.bar.cur, done=ok); card.update_files(c.fdone, all_done=ok, fstate=c.fstate)
         word = {"ok": "Done - ", "paused": "Paused - ", "cancelled": "Cancelled - "}.get(state, "Stopped - ")
         card.stat.configure(text=word + msg, fg=P["ok"] if ok else (P["warn"] if state == "paused" else P["err"])); card.set_mode("paused" if state == "paused" else "done")
 
@@ -504,7 +518,9 @@ def main():
         try:
             H.handle(c, ctl, r, first)
             if not ctl.silent and ctl.label != "Incoming":
-                ui(finish, ctl, "fail" if ctl.declined else "ok", "Declined" if ctl.declined else (f"received {ctl.got} file(s)" if ctl.got else "text received"))
+                ui(finish, ctl, "fail" if ctl.declined else "ok", "Declined" if ctl.declined else ((f"received {ctl.got} file(s)" if ctl.got else "text received") + (f", {len(ctl.fstate)} skipped" if ctl.fstate else "")))
+        except H.Rerun: ui(finish, ctl, "fail", "skipping the cancelled file - the sender reconnects without it")
+        except H.Desync as e: ui(finish, ctl, "fail", str(e))
         except H.Paused: ui(finish, ctl, "paused", "partial data kept. Press Resume and the sender continues")
         except InterruptedError: ui(finish, ctl, "cancelled", "cancelled; cached data discarded")
         except Exception as e:
@@ -733,7 +749,7 @@ def main():
             paint_done(card, c, state, msg)
         for c in list(active):
             card = make_card(c)
-            if c.names: card.set_files(c.names, c.sizes); card.update_files(c.fdone)
+            if c.names: card.set_files(c.names, c.sizes); card.update_files(c.fdone, fstate=c.fstate)
             if c.last[1]: on_prog(c, *c.last)
         WIN.style_titlebar(root, P["bg"], P["text"], P["accent"], P["dark"]); check_fw()
 

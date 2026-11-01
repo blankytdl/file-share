@@ -43,6 +43,18 @@ On the PC you can also pick a different folder for one transfer in the Accept di
 - Faster: large network buffers, disk + hashing overlapped with sending on the PC, Wi-Fi high-performance lock on Android, light animations while a transfer runs.
 - Files named with characters Windows refuses (`: ? " < > |`) are saved with `_` instead of failing; Windows antivirus locks no longer fail a finished file.
 
+## Cancel one file (PC app)
+Every file row in a running transfer card has its own small **X**. It skips just that file; the rest of the transfer carries on.
+- **Receiving:** the PC drops the connection, the sender reconnects by itself (a few seconds) and is told that file is "done", so it never sends it. Works with any sender.
+- **Sending:** the cancelled file (and files already delivered) are left out and the rest is sent as a fresh, smaller transfer. The phone may ask you to Accept again unless the PC is trusted/auto-accept there, and may keep a small partial file of the cancelled one until its cache is cleared.
+- The big X on the card still cancels the whole transfer. Skipped rows show "Skipped" in amber (never as an error).
+
+## "'utf-8' codec can't decode byte ... invalid continuation byte" (fixed)
+That message meant the PC expected a checksum line after a file but received raw file bytes: the two apps had lost step with each other after a reconnect
+(typically a phone running an older HotShare build that ignores the receiver's "done" list and resends files the PC already saved). It then repeated on every reconnect.
+Now the PC checks the checksum line instead of decoding it, switches that device to a compatibility mode for the resend, and if one particular file keeps
+disagreeing with its announced size it skips only that file (shown as Skipped) and finishes the rest. Updating the phone app to the build in this folder is still recommended.
+
 ## If the phone cannot find or send to the PC (but the PC finds the phone)
 That is almost always **Windows Firewall** on the PC (hotspot networks count as "Public", which the default prompt does not cover).
 HotShare now handles it two ways:
