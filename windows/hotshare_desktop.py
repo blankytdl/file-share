@@ -520,7 +520,7 @@ def main():
             if not ctl.silent and ctl.label != "Incoming":
                 ui(finish, ctl, "fail" if ctl.declined else "ok", "Declined" if ctl.declined else ((f"received {ctl.got} file(s)" if ctl.got else "text received") + (f", {len(ctl.fstate)} skipped" if ctl.fstate else "")))
         except H.Rerun: ui(finish, ctl, "fail", "skipping the cancelled file - the sender reconnects without it")
-        except H.Desync as e: ui(finish, ctl, "fail", str(e))
+        except (H.Desync, H.Mismatch) as e: ui(finish, ctl, "fail", str(e))
         except H.Paused: ui(finish, ctl, "paused", "partial data kept. Press Resume and the sender continues")
         except InterruptedError: ui(finish, ctl, "cancelled", "cancelled; cached data discarded")
         except Exception as e:

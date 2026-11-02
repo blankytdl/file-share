@@ -55,6 +55,16 @@ That message meant the PC expected a checksum line after a file but received raw
 Now the PC checks the checksum line instead of decoding it, switches that device to a compatibility mode for the resend, and if one particular file keeps
 disagreeing with its announced size it skips only that file (shown as Skipped) and finishes the rest. Updating the phone app to the build in this folder is still recommended.
 
+## Checksum mismatch on a slow or unstable connection (fixed)
+When a connection stalls, the phone gives up and reconnects, but the old connection can still deliver bytes it had buffered. The PC used to let both write into the same
+partial file, which corrupted it ("checksum mismatch") and could repeat. Now the newest connection of a transfer always wins: an older one is stopped, and a stale one
+whose header arrives late is refused. A file that still fails its checksum after one clean resend is skipped (shown as Skipped) instead of looping.
+
+## Automatic repair
+- **Damaged partial files:** while a file arrives, the PC saves a checkpoint (position + checksum) every 4 MB. Before resuming, it re-checks the partial file; if anything
+  was changed or lost (power cut, antivirus, disk error) it keeps the verified part, drops the rest and downloads only that again. The card log shows "Repaired ...".
+- **Failed checksum:** the file is downloaded again from scratch, up to 3 attempts, then only that file is skipped.
+
 ## If the phone cannot find or send to the PC (but the PC finds the phone)
 That is almost always **Windows Firewall** on the PC (hotspot networks count as "Public", which the default prompt does not cover).
 HotShare now handles it two ways:

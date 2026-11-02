@@ -9,7 +9,7 @@ Reverse connection (works even if the receiver's firewall blocks incoming connec
 Partial files stay in <folder>/.hotshare/<id>.part so a dropped link, a pause or a power cut resumes where it stopped.
 Interrupted sends are saved as jobs (jobs.json) so they can be resumed after a restart.
 """
-import hashlib, hmac, json, os, platform, queue, re, shutil, socket, threading, time
+import hashlib, hmac, itertools, json, os, platform, queue, re, shutil, socket, threading, time
 
 HOME = os.path.expanduser("~")
 CFG_PATH = os.path.join(HOME, ".hotshare", "config.json")
@@ -18,6 +18,8 @@ DEF = {"name": socket.gethostname(), "folder": os.path.join(HOME, "Downloads", "
 DISC, BUF, MAXH = 45454, 1 << 20, 16 << 20
 _lock = threading.Lock()
 APPROVED, PAUSED, CANCELLED = {}, set(), {}
+_SEQ = itertools.count(1)   # arrival order of connections: the NEWEST connection of a transfer always wins over older ones
+ACTIVE = {}   # transfer key -> socket of the connection currently receiving it (a reconnect must never write into the same partial files as a stale older connection)
 SKIP, BAD, LEGACY = {}, {}, set()   # per transfer: file ids the user cancelled / that could not be received / per-file strike count / peers whose sender ignores the "done" list
 FINISHED, FINALIZING = {}, set()   # per transfer: file ids already saved (a reconnect never resends them) / ids being moved into place right now     # approval memory per transfer (so reconnects never re-prompt) / transfers the receiving user paused
 
@@ -26,6 +28,9 @@ class Paused(Exception): """Paused by the user; partial data is kept."""
 class PeerPaused(Exception): """The receiver paused this transfer."""
 class ConnectionLost(Exception): """Could not reconnect within the reconnect window; resumable."""
 class Rerun(Exception): """Drop this connection on purpose so the sender reconnects (a file was cancelled)."""
+class Mismatch(IOError):
+    """A received file did not match the sender's checksum."""
+    def __init__(s, msg, fid=None): super().__init__(msg); s.fid = fid
 class Desync(Exception):
     """The other side's byte stream no longer matches the sizes it announced (older app version, or a file that changed size)."""
     def __init__(s, msg, fid=None): super().__init__(msg); s.fid = fid
@@ -93,8 +98,47 @@ def move_retry(src, dst, tries=12):
 
 
 def _rm(p):
-    try: os.remove(lp(p))
+    for q in ((p, p + ".chk") if p.endswith(".part") else (p,)):
+        try: os.remove(lp(q))
+        except OSError: pass
+
+
+CHK = 4 << 20    # while a file is received, a checkpoint (position + checksum of everything before it) is saved every 4 MiB
+
+
+def _chk_add(part, pos, md):
+    try:
+        with open(lp(part + ".chk"), "a", encoding="ascii") as c: c.write(f"{pos} {md.hexdigest()}\n")
     except OSError: pass
+
+
+def verify_part(p):
+    """Self-repair of a partial file before resuming it. Returns (good_length, md_of_those_bytes_or_None, damaged).
+    A partial written by this version has checkpoints: it is checked against them and cut back to the last one that still matches, so damage
+    (power cut, antivirus, a stale writer, disk error) costs a few MB of re-download instead of a corrupt file. One without checkpoints is trusted as is."""
+    n = os.path.getsize(lp(p)) if os.path.exists(lp(p)) else 0
+    try: cps = sorted({(int(a[0]), a[1]) for a in (l.split() for l in open(lp(p + ".chk"), encoding="ascii")) if len(a) == 2 and a[0].isdigit()})
+    except OSError: cps = None
+    if not n or cps is None: return n, None, False
+    md, pos, good, gmd, damaged = hashlib.sha256(), 0, 0, None, False
+    with open(lp(p), "rb") as f:
+        for off, hx in cps:
+            if off > n: damaged = True; break                  # the file is shorter than what was recorded
+            need = off - pos
+            while need > 0 and (b := f.read(min(BUF, need))): md.update(b); need -= len(b)
+            if need > 0: damaged = True; break
+            pos = off
+            if md.hexdigest() != hx: damaged = True; break     # bytes before this checkpoint changed after they were written
+            good, gmd = off, md.copy()
+    if good < n:
+        try: os.truncate(lp(p), good)
+        except OSError: _rm(p); return 0, None, True
+    try:
+        with open(lp(p + ".chk"), "w", encoding="ascii") as c:
+            for off, hx in cps:
+                if off <= good: c.write(f"{off} {hx}\n")
+    except OSError: pass
+    return good, gmd, damaged
 
 
 def hsize(n):
@@ -209,7 +253,7 @@ def readline(r, limit=65536):
 # ---------- receive (network reader + disk/hash writer run in parallel) ----------
 class _Writer(threading.Thread):
     def __init__(s, ctl, dest, key):
-        super().__init__(daemon=True); s.q, s.err, s.ctl, s.dest, s.f, s.md, s.key = queue.Queue(maxsize=8), None, ctl, dest, None, None, key
+        super().__init__(daemon=True); s.q, s.err, s.ctl, s.dest, s.f, s.md, s.key = queue.Queue(maxsize=8), None, ctl, dest, None, None, key; s.part, s.pos, s.last = None, 0, 0
 
     def put(s, m):
         while True:
@@ -223,18 +267,21 @@ class _Writer(threading.Thread):
                 m = s.q.get(); k = m[0]
                 if k == "stop": break
                 if k == "start":
-                    _, part, off = m; s.md = hashlib.sha256(); os.makedirs(lp(os.path.dirname(part)), exist_ok=True)    # another finished transfer may have removed the empty cache folder
-                    if off:
+                    _, part, off, md0 = m; s.md = md0 or hashlib.sha256(); s.part, s.pos, s.last = part, off, off; os.makedirs(lp(os.path.dirname(part)), exist_ok=True)    # another finished transfer may have removed the empty cache folder
+                    if off and md0 is None:                                  # a partial without checkpoints (older version): hash what is there and start checkpointing from it
                         with open(lp(part), "rb") as pf:
                             while b := pf.read(BUF): s.md.update(b)
+                        _chk_add(part, off, s.md)
                     s.f = open(lp(part), "ab", buffering=0)
-                elif k == "data": s.f.write(m[1]); s.md.update(m[1])
+                elif k == "data":
+                    s.f.write(m[1]); s.md.update(m[1]); s.pos += len(m[1])
+                    if s.pos - s.last >= CHK: _chk_add(s.part, s.pos, s.md); s.last = s.pos
                 elif k == "fin":
                     _, expected, part, rel, size, idx, fid_ = m; s.f.close(); s.f = None
-                    if expected != s.md.hexdigest(): _rm(part); raise IOError(f"checksum mismatch: {rel}")
+                    if expected != s.md.hexdigest(): _rm(part); raise Mismatch(f"checksum mismatch: {rel}", fid_)
                     FINALIZING.add(fid_)
                     try:
-                        final = unique(safe_path(s.dest, rel)); os.makedirs(lp(os.path.dirname(final)), exist_ok=True); move_retry(part, final)
+                        final = unique(safe_path(s.dest, rel)); os.makedirs(lp(os.path.dirname(final)), exist_ok=True); move_retry(part, final); _rm(part + ".chk")
                         FINISHED.setdefault(s.key, set()).add(fid_)          # from now on a reconnecting sender skips this file entirely
                     finally: FINALIZING.discard(fid_)
                     c = s.ctl; c.fdone[idx] = size; c.got += 1; c.log(f"Received {rel} ({hsize(size)})"); c.hist("in", rel, size, c._peer)
@@ -251,9 +298,10 @@ class _Writer(threading.Thread):
 
 
 def handle(sock, ctl, r=None, first=None):
-    r = r or sock.makefile("rb", BUF)
+    ctl.seq = next(_SEQ); r = r or sock.makefile("rb", BUF)
     try: _handle(sock, ctl, r, first)
     finally:   # always tear the connection down NOW: a lingering half-open socket makes the other side wait and keeps partial files locked
+        if ctl.key and ACTIVE.get(ctl.key, (0, None))[1] is sock: ACTIVE.pop(ctl.key, None)
         try: sock.shutdown(socket.SHUT_RDWR)
         except OSError: pass
         try: r.close()
@@ -288,13 +336,25 @@ def _handle(sock, ctl, r, first=None):
     if not ok:
         ctl.declined = True; sock.sendall(b"NO\n"); ctl.log(f"Declined transfer from {peer}"); return
     APPROVED[key] = (time.time(), root)
+    cur = ACTIVE.get(key)
+    if cur is not None and cur[1] is not sock:
+        if cur[0] > ctl.seq:                         # a newer connection already owns this transfer: this one is a stale leftover (its header was delayed on a bad link)
+            ctl.silent = True
+            try: sock.sendall(b"ERR stale connection\n")
+            except OSError: pass
+            return
+        try: cur[1].shutdown(socket.SHUT_RDWR)       # a half-dead OLDER connection: stop it and wait until it let go of the partial files
+        except OSError: pass
+        t1 = time.time()
+        while ACTIVE.get(key) is cur and time.time() - t1 < 20: time.sleep(.1)
+    ACTIVE[key] = (ctl.seq, sock)
     dest = safe_dir(root, h.get("dest", "")); pdir = os.path.join(root, ".hotshare"); os.makedirs(lp(pdir), exist_ok=True)
     t0 = time.time()
     while any(f.get("id") in FINALIZING for f in files) and time.time() - t0 < 900: time.sleep(.2)    # an earlier connection is still saving a big file: let it finish
     ids = {f.get("id") for f in files}; fin_ok = FINISHED.get(key, set()) & ids
     skipped = (SKIP.get(key, set()) & ids) - fin_ok           # files the user cancelled (or that kept failing): the sender is told they are done
     fin = fin_ok | skipped; legacy = peer in LEGACY            # legacy: this sender ignores the "done" list, so it must be told "I already hold every byte" instead
-    offs, parts = {}, {}
+    offs, parts, mds = {}, {}, {}
     for f in files:
         if f.get("t") != "file": continue
         if f["id"] in fin:
@@ -303,6 +363,9 @@ def _handle(sock, ctl, r, first=None):
         p = os.path.join(pdir, re.sub(r"[^0-9A-Za-z]", "", str(f["id"]))[:40] + ".part"); parts[f["id"]] = p
         n = os.path.getsize(lp(p)) if os.path.exists(lp(p)) else 0
         if n > f["size"]: _rm(p); n = 0
+        elif n:
+            was = n; n, mds[f["id"]], damaged = verify_part(p)
+            if damaged: ctl.log(f"Repaired {f['path']}: damage found in the partial file, keeping the verified {hsize(n)} and downloading the rest again")
         offs[f["id"]] = n
     ctl.parts = list(parts.values())
     total_left = sum(f["size"] for f in files if f.get("t") == "file" and f["id"] not in fin)
@@ -334,7 +397,7 @@ def _handle(sock, ctl, r, first=None):
             rel, size, off, part = f["path"], f["size"], offs[f["id"]], parts[f["id"]]
             if idx in ctl.skip_req: raise Rerun(f"skipped {rel}")
             if off: ctl.log(f"Resuming {rel} from {hsize(off)}")
-            w.put(("start", part, off)); left = size - off
+            w.put(("start", part, off, mds.get(f["id"]))); left = size - off
             while left:
                 if idx in ctl.skip_req: raise Rerun(f"skipped {rel}")
                 b = r.read(min(BUF, left))
@@ -353,6 +416,10 @@ def _handle(sock, ctl, r, first=None):
         if isinstance(e, Rerun):      # the user cancelled file(s): remember them, drop their partial data, and let the sender reconnect without them
             for ix in ctl.skip_req: SKIP.setdefault(key, set()).add(ctl.fids[ix])
             for i in SKIP.get(key, ()): _rm(parts.get(i, ""))
+        elif isinstance(e, Mismatch):                       # the file is re-sent from zero once; if it fails again it is skipped instead of looping forever
+            BAD[(key, e.fid)] = BAD.get((key, e.fid), 0) + 1; tries = BAD[(key, e.fid)]
+            if tries >= 3: SKIP.setdefault(key, set()).add(e.fid); e = Mismatch(f"{e} (3 times) - file skipped, the rest continues. It may be changing while it is read, or unreadable on the sender", e.fid)
+            else: e = Mismatch(f"{e} - repairing: downloading it again from scratch (attempt {tries + 1}/3)", e.fid)
         elif isinstance(e, Desync):
             if not legacy and any(f.get("t") == "file" and f["id"] in fin for f in files):    # first suspect: a sender that ignores the "done" list
                 LEGACY.add(peer); e = Desync(f"{e} - retrying in compatibility mode", e.fid)
