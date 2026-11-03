@@ -291,7 +291,7 @@ def main():
     WIN.dpi_aware()
     cfg = H.load_cfg(); os.makedirs(cfg["folder"], exist_ok=True); H.clean_partials(cfg["folder"])
     cfg["theme"] = {"dark": "Midnight", "light": "Daylight"}.get(cfg["theme"], cfg["theme"])
-    root = tk.Tk(); root.title("HotShare"); SC[0] = max(1.0, float(root.winfo_fpixels("1i")) / 96.0); FONT[0] = pick_font(root); apply_theme(cfg["theme"])
+    root = tk.Tk(); root.title(f"HotShare  ·  {H.BUILD}"); SC[0] = max(1.0, float(root.winfo_fpixels("1i")) / 96.0); FONT[0] = pick_font(root); apply_theme(cfg["theme"])
     root.geometry(f"{px(1080)}x{px(740)}"); root.minsize(px(900), px(600))
     try: root.iconbitmap(res("icon.ico"))
     except Exception:
@@ -520,11 +520,11 @@ def main():
             if not ctl.silent and ctl.label != "Incoming":
                 ui(finish, ctl, "fail" if ctl.declined else "ok", "Declined" if ctl.declined else ((f"received {ctl.got} file(s)" if ctl.got else "text received") + (f", {len(ctl.fstate)} skipped" if ctl.fstate else "")))
         except H.Rerun: ui(finish, ctl, "fail", "skipping the cancelled file - the sender reconnects without it")
-        except (H.Desync, H.Mismatch) as e: ui(finish, ctl, "fail", str(e))
+        except (H.Desync, H.Mismatch, H.BlockBad) as e: ui(finish, ctl, "fail", str(e))
         except H.Paused: ui(finish, ctl, "paused", "partial data kept. Press Resume and the sender continues")
         except InterruptedError: ui(finish, ctl, "cancelled", "cancelled; cached data discarded")
         except Exception as e:
-            if ctl.label != "Incoming" and not ctl.silent: ui(finish, ctl, "fail", f"{e} - partial data kept, the sender reconnects on its own")
+            if ctl.label != "Incoming" and not ctl.silent: ui(finish, ctl, "fail", f"{e} - partial data kept, the sender reconnects on its own [{H.BUILD}]")
         finally:
             try: c.close()
             except OSError: pass

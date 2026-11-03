@@ -28,6 +28,9 @@ class Paused(Exception): """Paused by the user; partial data is kept."""
 class PeerPaused(Exception): """The receiver paused this transfer."""
 class ConnectionLost(Exception): """Could not reconnect within the reconnect window; resumable."""
 class Rerun(Exception): """Drop this connection on purpose so the sender reconnects (a file was cancelled)."""
+class BlockBad(IOError):
+    """One block of a file arrived damaged (caught the moment it arrived). Only that block onwards is fetched again."""
+    def __init__(s, msg, fid=None, start=0): super().__init__(msg); s.fid, s.start = fid, start
 class Mismatch(IOError):
     """A received file did not match the sender's checksum."""
     def __init__(s, msg, fid=None): super().__init__(msg); s.fid = fid
@@ -103,12 +106,31 @@ def _rm(p):
         except OSError: pass
 
 
-CHK = 4 << 20    # while a file is received, a checkpoint (position + checksum of everything before it) is saved every 4 MiB
+BUILD = "r7-blockrepair"     # shown in the window title and in error messages so you can tell which build is running
+
+def where(e):
+    """'file.py:line' of the innermost frame of an exception, for error messages."""
+    import traceback
+    try: fr = traceback.extract_tb(e.__traceback__)[-1]; return f"{os.path.basename(fr.filename)}:{fr.lineno}"
+    except Exception: return "?"
+
+
+CHK = 4 << 20    # block size: a checkpoint (position + checksum of everything before it) is saved at every multiple of 4 MiB, and (when the sender supports it) every block is verified on arrival
 
 
 def _chk_add(part, pos, md):
     try:
         with open(lp(part + ".chk"), "a", encoding="ascii") as c: c.write(f"{pos} {md.hexdigest()}\n")
+    except OSError: pass
+
+
+def _cut_part(p, start):
+    """Cut a partial file back to `start` (the beginning of a damaged block) and forget the checkpoints after it."""
+    if not p: return
+    try:
+        if os.path.exists(lp(p)) and os.path.getsize(lp(p)) > start: os.truncate(lp(p), start)
+        keep = [l for l in open(lp(p + ".chk"), encoding="ascii") if l.split() and l.split()[0].isdigit() and int(l.split()[0]) <= start]
+        with open(lp(p + ".chk"), "w", encoding="ascii") as c: c.writelines(keep)
     except OSError: pass
 
 
@@ -275,7 +297,7 @@ class _Writer(threading.Thread):
                     s.f = open(lp(part), "ab", buffering=0)
                 elif k == "data":
                     s.f.write(m[1]); s.md.update(m[1]); s.pos += len(m[1])
-                    if s.pos - s.last >= CHK: _chk_add(s.part, s.pos, s.md); s.last = s.pos
+                    if s.pos % CHK == 0: _chk_add(s.part, s.pos, s.md)
                 elif k == "fin":
                     _, expected, part, rel, size, idx, fid_ = m; s.f.close(); s.f = None
                     if expected != s.md.hexdigest(): _rm(part); raise Mismatch(f"checksum mismatch: {rel}", fid_)
@@ -371,7 +393,8 @@ def _handle(sock, ctl, r, first=None):
     total_left = sum(f["size"] for f in files if f.get("t") == "file" and f["id"] not in fin)
     if shutil.disk_usage(root).free < total_left - sum(offs.values()):
         sock.sendall(b"ERR not enough free space\n"); raise IOError("not enough free space")
-    sock.sendall(b"OK\n" + json.dumps({"off": offs, "done": [] if legacy else sorted(fin)}).encode() + b"\n")
+    blk_mode = "blk" in (h.get("caps") or [])      # the sender can append a checksum after every block: we verify each block the moment it arrives
+    sock.sendall(b"OK\n" + json.dumps({"off": offs, "done": [] if legacy else sorted(fin), **({"blk": CHK} if blk_mode else {})}).encode() + b"\n")
     total -= sum(f["size"] for f in files if f.get("t") == "file" and f["id"] in skipped)
     done = sum(n for i, n in offs.items() if i in parts) + sum(f["size"] for f in files if f.get("t") == "file" and f["id"] in fin_ok); ctl.start(done)
     ctl.set_files([f["path"] if f["t"] == "file" else "Text message" for f in files], [f.get("size", 0) for f in files]); ctl.fids = [f["id"] for f in files]
@@ -393,16 +416,21 @@ def _handle(sock, ctl, r, first=None):
                 if legacy and f.get("t") == "file": hashline(f)      # old sender: it still sends the checksum line of a file we already hold
                 continue
             if f.get("t") == "text":
-                txt = str(f.get("text", ""))[:1_000_000]; ctl.text(peer, txt); ctl.hist("in", "text", len(txt.encode()), peer); ctl.fdone[idx] = ctl.sizes[idx]; FINISHED.setdefault(key, set()).add(f["id"]); continue
+                txt = str(f.get("text", ""))[:1_000_000]; ctl.text(peer, txt); ctl.hist("in", "text", len(txt.encode("utf-8", "replace")), peer); ctl.fdone[idx] = ctl.sizes[idx]; FINISHED.setdefault(key, set()).add(f["id"]); continue
             rel, size, off, part = f["path"], f["size"], offs[f["id"]], parts[f["id"]]
             if idx in ctl.skip_req: raise Rerun(f"skipped {rel}")
             if off: ctl.log(f"Resuming {rel} from {hsize(off)}")
-            w.put(("start", part, off, mds.get(f["id"]))); left = size - off
+            w.put(("start", part, off, mds.get(f["id"]))); left = size - off; pos = off; bmd = hashlib.sha256()
             while left:
                 if idx in ctl.skip_req: raise Rerun(f"skipped {rel}")
-                b = r.read(min(BUF, left))
+                b = r.read(min(BUF, left, CHK - pos % CHK))      # never read across a block boundary
                 if not b: raise ConnectionError("connection lost")
-                left -= len(b); done += len(b); ctl.fdone[idx] = size - left; w.put(("data", b)); ctl.tick(done, total)
+                left -= len(b); pos += len(b); done += len(b); ctl.fdone[idx] = size - left; w.put(("data", b)); ctl.tick(done, total)
+                if blk_mode:
+                    bmd.update(b)
+                    if pos % CHK == 0 or not left:               # end of a block: its checksum follows
+                        if hashline(f) != bmd.hexdigest(): raise BlockBad(f"'{rel}'", f["id"], (pos - 1) // CHK * CHK)
+                        bmd = hashlib.sha256()
             w.put(("fin", hashline(f), part, rel, size, idx, f["id"]))
         w.finish()
         if w.err: raise w.err
@@ -416,10 +444,18 @@ def _handle(sock, ctl, r, first=None):
         if isinstance(e, Rerun):      # the user cancelled file(s): remember them, drop their partial data, and let the sender reconnect without them
             for ix in ctl.skip_req: SKIP.setdefault(key, set()).add(ctl.fids[ix])
             for i in SKIP.get(key, ()): _rm(parts.get(i, ""))
+        elif isinstance(e, BlockBad):                       # damaged in transit: keep everything before the bad block, fetch from there again
+            _cut_part(parts.get(e.fid, ""), e.start)
+            c_ = BAD[(key, e.fid, e.start)] = BAD.get((key, e.fid, e.start), 0) + 1
+            tot = sum(v for k_, v in BAD.items() if len(k_) == 3 and k_[:2] == (key, e.fid))
+            if c_ >= 5 or tot >= 40: SKIP.setdefault(key, set()).add(e.fid); _rm(parts.get(e.fid, "")); e = BlockBad(f"data keeps arriving damaged in {e} at {hsize(e.start)} - file skipped, the rest continues", e.fid, e.start)
+            else: e = BlockBad(f"data damaged in transit in {e} at {hsize(e.start)} - repairing: fetching again from that point (repair {tot})", e.fid, e.start)
         elif isinstance(e, Mismatch):                       # the file is re-sent from zero once; if it fails again it is skipped instead of looping forever
             BAD[(key, e.fid)] = BAD.get((key, e.fid), 0) + 1; tries = BAD[(key, e.fid)]
             if tries >= 3: SKIP.setdefault(key, set()).add(e.fid); e = Mismatch(f"{e} (3 times) - file skipped, the rest continues. It may be changing while it is read, or unreadable on the sender", e.fid)
             else: e = Mismatch(f"{e} - repairing: downloading it again from scratch (attempt {tries + 1}/3)", e.fid)
+        elif isinstance(e, UnicodeError):
+            e = Desync(f"unreadable text from the sender at {where(e)} ({type(e).__name__}) [build {BUILD}]", None)
         elif isinstance(e, Desync):
             if not legacy and any(f.get("t") == "file" and f["id"] in fin for f in files):    # first suspect: a sender that ignores the "done" list
                 LEGACY.add(peer); e = Desync(f"{e} - retrying in compatibility mode", e.fid)
@@ -459,7 +495,7 @@ def collect(paths):
 def text_item(txt): return {"t": "text", "text": txt, "rel": "text", "size": len(txt.encode())}
 
 
-def _producer(items, offs, dones, q, stop):
+def _producer(items, offs, dones, q, stop, blk=0):
     def put(m):
         while not stop.is_set():
             try: q.put(m, timeout=.5); return
@@ -475,12 +511,15 @@ def _producer(items, offs, dones, q, stop):
                     b = f.read(min(BUF, left))
                     if not b: raise IOError("file changed while sending: " + it["rel"])
                     md.update(b); left -= len(b)
-                put(("start", ix, off)); left = it["size"] - off
+                put(("start", ix, off)); left = it["size"] - off; pos = off; bmd = hashlib.sha256()
                 while left:
                     if stop.is_set(): return
-                    b = f.read(min(BUF, left))
+                    b = f.read(min(BUF, left, (blk - pos % blk) if blk else BUF))
                     if not b: raise IOError("file shrank while sending: " + it["rel"])
-                    md.update(b); left -= len(b); put(("data", ix, b))
+                    md.update(b); left -= len(b); pos += len(b); put(("data", ix, b))
+                    if blk:
+                        bmd.update(b)
+                        if pos % blk == 0 or not left: put(("bhash", ix, bmd.hexdigest())); bmd = hashlib.sha256()
             put(("hash", ix, md.hexdigest()))
         put(("end",))
     except BaseException as e: put(("err", e))
@@ -510,19 +549,19 @@ def _send_over(s, r, items, ctl, dest, host):
             man.append({"id": it["id"], "t": "file", "path": it["rel"].replace("\\", "/"), "size": it["size"]})
     stop = threading.Event(); th = None
     try:
-        s.sendall(b"HSH3\n" + json.dumps({"name": cfg["name"], "pin": cfg["pin"], "dest": dest, "files": man}).encode() + b"\n")
+        s.sendall(b"HSH3\n" + json.dumps({"name": cfg["name"], "pin": cfg["pin"], "dest": dest, "files": man, "caps": ["blk"]}).encode() + b"\n")
         resp = readline(r)
         if resp.startswith(b"ERR"):
             msg = resp[4:].decode("utf-8", "replace")
             raise PeerPaused(msg) if msg == "paused" else PermissionError(msg)
         if resp != b"OK": raise PermissionError("Receiver declined (or PIN mismatch)")
         ctl.connected = True; s.settimeout(300); ctl.set_state("running", "")
-        reply = json.loads(readline(r, MAXH)); offs, dones = reply["off"], set(reply.get("done", []))
+        reply = json.loads(readline(r, MAXH).decode("utf-8", "replace")); offs, dones = reply["off"], set(reply.get("done", [])); blk = int(reply.get("blk", 0) or 0)
         done = sum(offs.values()) + sum(it["size"] for it in items if it["t"] == "file" and it["id"] in dones); ctl.start(done)
         if len(ctl.names) != len(all_items): ctl.set_files(["Text message" if it["t"] == "text" else it["rel"] for it in all_items], [it["size"] for it in all_items])   # first connection only: later ones keep the rows
         for ix, it in enumerate(items):
             if it["t"] == "file": ctl.fdone[omap[ix]] = it["size"] if it["id"] in dones else min(max(int(offs.get(it["id"], 0)), 0), it["size"])
-        q = queue.Queue(maxsize=8); th = threading.Thread(target=_producer, args=(items, offs, dones, q, stop), daemon=True); th.start()
+        q = queue.Queue(maxsize=8); th = threading.Thread(target=_producer, args=(items, offs, dones, q, stop, blk), daemon=True); th.start()
         while True:
             m = q.get(); k = m[0]
             if k == "end": break
@@ -535,9 +574,10 @@ def _send_over(s, r, items, ctl, dest, host):
             elif k == "data":
                 if ox in ctl.skip_req: raise Rerun("file cancelled")
                 s.sendall(m[2]); done += len(m[2]); ctl.fdone[ox] += len(m[2]); ctl.tick(done, total)
+            elif k == "bhash": s.sendall(m[2].encode() + b"\n")
             elif k == "hash": s.sendall(m[2].encode() + b"\n"); ctl.fdone[ox] = items[ix]["size"]; ctl.fsent.add(ox)
         s.settimeout(1800)       # the receiver may spend minutes moving / virus-scanning a big file before it says DONE: that is NOT a dead connection
-        res = readline(r).decode()
+        res = readline(r).decode("utf-8", "replace")
         if res == "ERR paused": raise PeerPaused("paused")
         if res != "DONE": raise IOError(res or "no reply")
         ctl.progress(total, total, 0, 0); ctl.log(f"Sent {len(items)} item(s), {hsize(total)} to {ctl.label or host}")

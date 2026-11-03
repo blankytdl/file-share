@@ -65,6 +65,13 @@ whose header arrives late is refused. A file that still fails its checksum after
   was changed or lost (power cut, antivirus, disk error) it keeps the verified part, drops the rest and downloads only that again. The card log shows "Repaired ...".
 - **Failed checksum:** the file is downloaded again from scratch, up to 3 attempts, then only that file is skipped.
 
+## Block verification (damage found the moment it arrives)
+A new sender announces `"caps":["blk"]` in its header; the receiver answers with `"blk": 4194304` and the sender then writes a SHA-256 line after every 4 MiB block
+(block boundaries are absolute file offsets). The receiver checks each block as it arrives. If one is damaged it keeps everything before it, cuts the partial file back to
+the start of that block and the sender resumes from there - one bad block costs 4 MB, not the whole video. The same block failing 5 times (or 40 repairs in one file)
+skips only that file. Senders that don't announce `blk` (older apps) keep working exactly as before with the whole-file checksum only.
+The phone side lives in `Core.kt` (`sendStream`) - rebuild the APK to get it. The Windows app shows the build tag `r7-blockrepair` in its title.
+
 ## If the phone cannot find or send to the PC (but the PC finds the phone)
 That is almost always **Windows Firewall** on the PC (hotspot networks count as "Public", which the default prompt does not cover).
 HotShare now handles it two ways:
