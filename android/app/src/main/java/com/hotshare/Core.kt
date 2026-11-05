@@ -315,12 +315,12 @@ object Core {
             if (item.text != null) { man.put(JSONObject().put("id", "t${sent.size}").put("t", "text").put("path", "text").put("size", item.size).put("text", item.text)); sent.add(item) }
             else { val id = fid(item.rel, item.size, item.mtime); if (ids.containsValue(id)) continue; ids[item] = id; sent.add(item); total += item.size; man.put(JSONObject().put("id", id).put("t", "file").put("path", item.rel).put("size", item.size)) }
         }
-        out.write("HSH3\n${JSONObject().put("name", cfg("name", Build.MODEL)).put("pin", cfg("pin")).put("dest", dest).put("files", man).put("caps", "blk")}\n".toByteArray()); out.flush()
+        out.write("HSH3\n${JSONObject().put("name", cfg("name", Build.MODEL)).put("pin", cfg("pin")).put("dest", dest).put("files", man)}\n".toByteArray()); out.flush()
         val resp = readLine(inp)
         if (resp.startsWith("ERR")) { val m = resp.drop(4); throw if (m == "paused") PeerPaused(m) else Declined(m) }
         if (resp != "OK") throw Declined("$devName declined (or PIN mismatch)")
         t.connectedOnce = true; plain?.soTimeout = 300000; setState(t, "running", "")
-        val reply = JSONObject(readLine(inp, MAXH)); val offs = reply.getJSONObject("off"); val dones = HashSet<String>(); val blk = reply.optLong("blk", 0L)   // blk > 0: the receiver verifies every block, so a checksum line follows each one
+        val reply = JSONObject(readLine(inp, MAXH)); val offs = reply.getJSONObject("off"); val dones = HashSet<String>()
         reply.optJSONArray("done")?.let { a -> for (i in 0 until a.length()) dones.add(a.getString(i)) }          // files the receiver has ALREADY SAVED: never resend them
         var done = 0L; for ((x, id) in ids) done += if (id in dones) x.size else offs.optLong(id, 0)
         t.total = total; t.base = done; t.t0 = System.currentTimeMillis(); val buf = ByteArray(BUF); val md = MessageDigest.getInstance("SHA-256")
@@ -332,13 +332,8 @@ object Core {
             val off = offs.optLong(id, 0).coerceIn(0, item.size); md.reset()
             item.open().use { s ->
                 var left = off; while (left > 0) { val n = s.read(buf, 0, minOf(buf.size.toLong(), left).toInt()); if (n < 0) throw IOException("file changed"); md.update(buf, 0, n); left -= n }
-                left = item.size - off; var pos = off; val bmd = MessageDigest.getInstance("SHA-256")
-                while (left > 0) {
-                    val room = if (blk > 0L) minOf(left, blk - pos % blk) else left          // never cross a block boundary
-                    val n = s.read(buf, 0, minOf(buf.size.toLong(), room).toInt()); if (n < 0) throw IOException("file shrank")
-                    out.write(buf, 0, n); md.update(buf, 0, n); left -= n; pos += n; done += n; t.fdone[ix] = item.size - left; tick(t, done)
-                    if (blk > 0L) { bmd.update(buf, 0, n); if (pos % blk == 0L || left == 0L) out.write((hex(bmd.digest()) + "\n").toByteArray()) }   // digest() also resets for the next block
-                }
+                left = item.size - off
+                while (left > 0) { val n = s.read(buf, 0, minOf(buf.size.toLong(), left).toInt()); if (n < 0) throw IOException("file shrank"); out.write(buf, 0, n); md.update(buf, 0, n); left -= n; done += n; t.fdone[ix] = item.size - left; tick(t, done) }
             }
             out.write((hex(md.digest()) + "\n").toByteArray()); t.fdone[ix] = item.size
         }

@@ -43,35 +43,6 @@ On the PC you can also pick a different folder for one transfer in the Accept di
 - Faster: large network buffers, disk + hashing overlapped with sending on the PC, Wi-Fi high-performance lock on Android, light animations while a transfer runs.
 - Files named with characters Windows refuses (`: ? " < > |`) are saved with `_` instead of failing; Windows antivirus locks no longer fail a finished file.
 
-## Cancel one file (PC app)
-Every file row in a running transfer card has its own small **X**. It skips just that file; the rest of the transfer carries on.
-- **Receiving:** the PC drops the connection, the sender reconnects by itself (a few seconds) and is told that file is "done", so it never sends it. Works with any sender.
-- **Sending:** the cancelled file (and files already delivered) are left out and the rest is sent as a fresh, smaller transfer. The phone may ask you to Accept again unless the PC is trusted/auto-accept there, and may keep a small partial file of the cancelled one until its cache is cleared.
-- The big X on the card still cancels the whole transfer. Skipped rows show "Skipped" in amber (never as an error).
-
-## "'utf-8' codec can't decode byte ... invalid continuation byte" (fixed)
-That message meant the PC expected a checksum line after a file but received raw file bytes: the two apps had lost step with each other after a reconnect
-(typically a phone running an older HotShare build that ignores the receiver's "done" list and resends files the PC already saved). It then repeated on every reconnect.
-Now the PC checks the checksum line instead of decoding it, switches that device to a compatibility mode for the resend, and if one particular file keeps
-disagreeing with its announced size it skips only that file (shown as Skipped) and finishes the rest. Updating the phone app to the build in this folder is still recommended.
-
-## Checksum mismatch on a slow or unstable connection (fixed)
-When a connection stalls, the phone gives up and reconnects, but the old connection can still deliver bytes it had buffered. The PC used to let both write into the same
-partial file, which corrupted it ("checksum mismatch") and could repeat. Now the newest connection of a transfer always wins: an older one is stopped, and a stale one
-whose header arrives late is refused. A file that still fails its checksum after one clean resend is skipped (shown as Skipped) instead of looping.
-
-## Automatic repair
-- **Damaged partial files:** while a file arrives, the PC saves a checkpoint (position + checksum) every 4 MB. Before resuming, it re-checks the partial file; if anything
-  was changed or lost (power cut, antivirus, disk error) it keeps the verified part, drops the rest and downloads only that again. The card log shows "Repaired ...".
-- **Failed checksum:** the file is downloaded again from scratch, up to 3 attempts, then only that file is skipped.
-
-## Block verification (damage found the moment it arrives)
-A new sender announces `"caps":["blk"]` in its header; the receiver answers with `"blk": 4194304` and the sender then writes a SHA-256 line after every 4 MiB block
-(block boundaries are absolute file offsets). The receiver checks each block as it arrives. If one is damaged it keeps everything before it, cuts the partial file back to
-the start of that block and the sender resumes from there - one bad block costs 4 MB, not the whole video. The same block failing 5 times (or 40 repairs in one file)
-skips only that file. Senders that don't announce `blk` (older apps) keep working exactly as before with the whole-file checksum only.
-The phone side lives in `Core.kt` (`sendStream`) - rebuild the APK to get it. The Windows app shows the build tag `r7-blockrepair` in its title.
-
 ## If the phone cannot find or send to the PC (but the PC finds the phone)
 That is almost always **Windows Firewall** on the PC (hotspot networks count as "Public", which the default prompt does not cover).
 HotShare now handles it two ways:

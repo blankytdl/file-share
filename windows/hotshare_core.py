@@ -9,7 +9,7 @@ Reverse connection (works even if the receiver's firewall blocks incoming connec
 Partial files stay in <folder>/.hotshare/<id>.part so a dropped link, a pause or a power cut resumes where it stopped.
 Interrupted sends are saved as jobs (jobs.json) so they can be resumed after a restart.
 """
-import hashlib, hmac, itertools, json, os, platform, queue, re, shutil, socket, threading, time
+import hashlib, hmac, json, os, platform, queue, re, shutil, socket, threading, time
 
 HOME = os.path.expanduser("~")
 CFG_PATH = os.path.join(HOME, ".hotshare", "config.json")
@@ -18,25 +18,12 @@ DEF = {"name": socket.gethostname(), "folder": os.path.join(HOME, "Downloads", "
 DISC, BUF, MAXH = 45454, 1 << 20, 16 << 20
 _lock = threading.Lock()
 APPROVED, PAUSED, CANCELLED = {}, set(), {}
-_SEQ = itertools.count(1)   # arrival order of connections: the NEWEST connection of a transfer always wins over older ones
-ACTIVE = {}   # transfer key -> socket of the connection currently receiving it (a reconnect must never write into the same partial files as a stale older connection)
-SKIP, BAD, LEGACY = {}, {}, set()   # per transfer: file ids the user cancelled / that could not be received / per-file strike count / peers whose sender ignores the "done" list
 FINISHED, FINALIZING = {}, set()   # per transfer: file ids already saved (a reconnect never resends them) / ids being moved into place right now     # approval memory per transfer (so reconnects never re-prompt) / transfers the receiving user paused
 
 
 class Paused(Exception): """Paused by the user; partial data is kept."""
 class PeerPaused(Exception): """The receiver paused this transfer."""
 class ConnectionLost(Exception): """Could not reconnect within the reconnect window; resumable."""
-class Rerun(Exception): """Drop this connection on purpose so the sender reconnects (a file was cancelled)."""
-class BlockBad(IOError):
-    """One block of a file arrived damaged (caught the moment it arrived). Only that block onwards is fetched again."""
-    def __init__(s, msg, fid=None, start=0): super().__init__(msg); s.fid, s.start = fid, start
-class Mismatch(IOError):
-    """A received file did not match the sender's checksum."""
-    def __init__(s, msg, fid=None): super().__init__(msg); s.fid = fid
-class Desync(Exception):
-    """The other side's byte stream no longer matches the sizes it announced (older app version, or a file that changed size)."""
-    def __init__(s, msg, fid=None): super().__init__(msg); s.fid = fid
 class Unreachable(ConnectionRefusedError): """Nobody answered on the first attempt (closed app, wrong network, or a firewall)."""
 
 
@@ -57,7 +44,6 @@ def save_cfg(c):
 
 
 # ---------- file names that are safe on Windows (phones allow characters Windows refuses) ----------
-_HEX = re.compile(rb"[0-9a-f]{64}")
 _BAD = re.compile(r'[<>:"|?*\x00-\x1f]')
 _RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
@@ -101,66 +87,8 @@ def move_retry(src, dst, tries=12):
 
 
 def _rm(p):
-    for q in ((p, p + ".chk") if p.endswith(".part") else (p,)):
-        try: os.remove(lp(q))
-        except OSError: pass
-
-
-BUILD = "r7-blockrepair"     # shown in the window title and in error messages so you can tell which build is running
-
-def where(e):
-    """'file.py:line' of the innermost frame of an exception, for error messages."""
-    import traceback
-    try: fr = traceback.extract_tb(e.__traceback__)[-1]; return f"{os.path.basename(fr.filename)}:{fr.lineno}"
-    except Exception: return "?"
-
-
-CHK = 4 << 20    # block size: a checkpoint (position + checksum of everything before it) is saved at every multiple of 4 MiB, and (when the sender supports it) every block is verified on arrival
-
-
-def _chk_add(part, pos, md):
-    try:
-        with open(lp(part + ".chk"), "a", encoding="ascii") as c: c.write(f"{pos} {md.hexdigest()}\n")
+    try: os.remove(lp(p))
     except OSError: pass
-
-
-def _cut_part(p, start):
-    """Cut a partial file back to `start` (the beginning of a damaged block) and forget the checkpoints after it."""
-    if not p: return
-    try:
-        if os.path.exists(lp(p)) and os.path.getsize(lp(p)) > start: os.truncate(lp(p), start)
-        keep = [l for l in open(lp(p + ".chk"), encoding="ascii") if l.split() and l.split()[0].isdigit() and int(l.split()[0]) <= start]
-        with open(lp(p + ".chk"), "w", encoding="ascii") as c: c.writelines(keep)
-    except OSError: pass
-
-
-def verify_part(p):
-    """Self-repair of a partial file before resuming it. Returns (good_length, md_of_those_bytes_or_None, damaged).
-    A partial written by this version has checkpoints: it is checked against them and cut back to the last one that still matches, so damage
-    (power cut, antivirus, a stale writer, disk error) costs a few MB of re-download instead of a corrupt file. One without checkpoints is trusted as is."""
-    n = os.path.getsize(lp(p)) if os.path.exists(lp(p)) else 0
-    try: cps = sorted({(int(a[0]), a[1]) for a in (l.split() for l in open(lp(p + ".chk"), encoding="ascii")) if len(a) == 2 and a[0].isdigit()})
-    except OSError: cps = None
-    if not n or cps is None: return n, None, False
-    md, pos, good, gmd, damaged = hashlib.sha256(), 0, 0, None, False
-    with open(lp(p), "rb") as f:
-        for off, hx in cps:
-            if off > n: damaged = True; break                  # the file is shorter than what was recorded
-            need = off - pos
-            while need > 0 and (b := f.read(min(BUF, need))): md.update(b); need -= len(b)
-            if need > 0: damaged = True; break
-            pos = off
-            if md.hexdigest() != hx: damaged = True; break     # bytes before this checkpoint changed after they were written
-            good, gmd = off, md.copy()
-    if good < n:
-        try: os.truncate(lp(p), good)
-        except OSError: _rm(p); return 0, None, True
-    try:
-        with open(lp(p + ".chk"), "w", encoding="ascii") as c:
-            for off, hx in cps:
-                if off <= good: c.write(f"{off} {hx}\n")
-    except OSError: pass
-    return good, gmd, damaged
 
 
 def hsize(n):
@@ -221,7 +149,7 @@ def clear_cache(root, jobs=True):
         os.rmdir(d)
     except OSError: pass
     if jobs: _write_jobs([])
-    FINISHED.clear(); SKIP.clear(); BAD.clear()
+    FINISHED.clear()
     return n
 
 
@@ -245,16 +173,10 @@ class Ctl:
         s.cancel, s.pause = threading.Event(), threading.Event()
         s._t0 = s._last = s._base = 0; s.moved = s._seen = 0; s.key = None; s.parts = []; s.job = None; s.state = ""
         s.names, s.sizes, s.fdone, s.last, s.on_files = [], [], [], (0, 0, 0, 0), (lambda: None); s.on_state = lambda st, msg: None
-        s.fids, s.fstate, s.skip_req, s.gone, s.fsent = [], {}, set(), set(), set()   # per-file: ids / "skipped" rows / cancel requests / rows removed from the manifest / rows already fully sent
 
     def set_state(s, st, msg=""): s.state = st; s.on_state(st, msg)
     def set_files(s, names, sizes): s.names, s.sizes, s.fdone = list(names), list(sizes), [0] * len(names); s.on_files()
     def start(s, base=0): s._t0, s._last, s._base = time.monotonic(), 0, base
-
-    def cancel_file(s, ix):
-        """Skip ONE file of this transfer; the other files carry on. Returns False if that file is already finished."""
-        if not 0 <= ix < len(s.sizes) or ix in s.fstate or (s.sizes[ix] > 0 and s.fdone[ix] >= s.sizes[ix]) or ix in s.fsent: return False
-        s.skip_req.add(ix); s.fstate[ix] = "skipped"; s.progress(*s.last); return True
 
     def tick(s, done, total):
         if s.cancel.is_set(): raise InterruptedError("cancelled")
@@ -275,7 +197,7 @@ def readline(r, limit=65536):
 # ---------- receive (network reader + disk/hash writer run in parallel) ----------
 class _Writer(threading.Thread):
     def __init__(s, ctl, dest, key):
-        super().__init__(daemon=True); s.q, s.err, s.ctl, s.dest, s.f, s.md, s.key = queue.Queue(maxsize=8), None, ctl, dest, None, None, key; s.part, s.pos, s.last = None, 0, 0
+        super().__init__(daemon=True); s.q, s.err, s.ctl, s.dest, s.f, s.md, s.key = queue.Queue(maxsize=8), None, ctl, dest, None, None, key
 
     def put(s, m):
         while True:
@@ -289,21 +211,18 @@ class _Writer(threading.Thread):
                 m = s.q.get(); k = m[0]
                 if k == "stop": break
                 if k == "start":
-                    _, part, off, md0 = m; s.md = md0 or hashlib.sha256(); s.part, s.pos, s.last = part, off, off; os.makedirs(lp(os.path.dirname(part)), exist_ok=True)    # another finished transfer may have removed the empty cache folder
-                    if off and md0 is None:                                  # a partial without checkpoints (older version): hash what is there and start checkpointing from it
+                    _, part, off = m; s.md = hashlib.sha256(); os.makedirs(lp(os.path.dirname(part)), exist_ok=True)    # another finished transfer may have removed the empty cache folder
+                    if off:
                         with open(lp(part), "rb") as pf:
                             while b := pf.read(BUF): s.md.update(b)
-                        _chk_add(part, off, s.md)
                     s.f = open(lp(part), "ab", buffering=0)
-                elif k == "data":
-                    s.f.write(m[1]); s.md.update(m[1]); s.pos += len(m[1])
-                    if s.pos % CHK == 0: _chk_add(s.part, s.pos, s.md)
+                elif k == "data": s.f.write(m[1]); s.md.update(m[1])
                 elif k == "fin":
                     _, expected, part, rel, size, idx, fid_ = m; s.f.close(); s.f = None
-                    if expected != s.md.hexdigest(): _rm(part); raise Mismatch(f"checksum mismatch: {rel}", fid_)
+                    if expected != s.md.hexdigest(): _rm(part); raise IOError(f"checksum mismatch: {rel}")
                     FINALIZING.add(fid_)
                     try:
-                        final = unique(safe_path(s.dest, rel)); os.makedirs(lp(os.path.dirname(final)), exist_ok=True); move_retry(part, final); _rm(part + ".chk")
+                        final = unique(safe_path(s.dest, rel)); os.makedirs(lp(os.path.dirname(final)), exist_ok=True); move_retry(part, final)
                         FINISHED.setdefault(s.key, set()).add(fid_)          # from now on a reconnecting sender skips this file entirely
                     finally: FINALIZING.discard(fid_)
                     c = s.ctl; c.fdone[idx] = size; c.got += 1; c.log(f"Received {rel} ({hsize(size)})"); c.hist("in", rel, size, c._peer)
@@ -320,10 +239,9 @@ class _Writer(threading.Thread):
 
 
 def handle(sock, ctl, r=None, first=None):
-    ctl.seq = next(_SEQ); r = r or sock.makefile("rb", BUF)
+    r = r or sock.makefile("rb", BUF)
     try: _handle(sock, ctl, r, first)
     finally:   # always tear the connection down NOW: a lingering half-open socket makes the other side wait and keeps partial files locked
-        if ctl.key and ACTIVE.get(ctl.key, (0, None))[1] is sock: ACTIVE.pop(ctl.key, None)
         try: sock.shutdown(socket.SHUT_RDWR)
         except OSError: pass
         try: r.close()
@@ -340,7 +258,7 @@ def _handle(sock, ctl, r, first=None):
         if cfg.get("visible", True): sock.sendall(json.dumps({"name": cfg["name"], "port": cfg["port"], "os": platform.system()}).encode() + b"\n")
         return
     if first != b"HSH3": return
-    h = json.loads(readline(r, MAXH).decode("utf-8", "replace")); peer = str(h.get("name", "?")); files = h["files"]; ctl.label = ctl._peer = peer
+    h = json.loads(readline(r, MAXH)); peer = str(h.get("name", "?")); files = h["files"]; ctl.label = ctl._peer = peer
     if len(files) > 200000: raise ValueError("too many files")
     for f in files:
         if f.get("t") not in ("file", "text") or (f["t"] == "file" and (not isinstance(f.get("size"), int) or f["size"] < 0)): raise ValueError("bad manifest")
@@ -358,115 +276,54 @@ def _handle(sock, ctl, r, first=None):
     if not ok:
         ctl.declined = True; sock.sendall(b"NO\n"); ctl.log(f"Declined transfer from {peer}"); return
     APPROVED[key] = (time.time(), root)
-    cur = ACTIVE.get(key)
-    if cur is not None and cur[1] is not sock:
-        if cur[0] > ctl.seq:                         # a newer connection already owns this transfer: this one is a stale leftover (its header was delayed on a bad link)
-            ctl.silent = True
-            try: sock.sendall(b"ERR stale connection\n")
-            except OSError: pass
-            return
-        try: cur[1].shutdown(socket.SHUT_RDWR)       # a half-dead OLDER connection: stop it and wait until it let go of the partial files
-        except OSError: pass
-        t1 = time.time()
-        while ACTIVE.get(key) is cur and time.time() - t1 < 20: time.sleep(.1)
-    ACTIVE[key] = (ctl.seq, sock)
     dest = safe_dir(root, h.get("dest", "")); pdir = os.path.join(root, ".hotshare"); os.makedirs(lp(pdir), exist_ok=True)
     t0 = time.time()
     while any(f.get("id") in FINALIZING for f in files) and time.time() - t0 < 900: time.sleep(.2)    # an earlier connection is still saving a big file: let it finish
-    ids = {f.get("id") for f in files}; fin_ok = FINISHED.get(key, set()) & ids
-    skipped = (SKIP.get(key, set()) & ids) - fin_ok           # files the user cancelled (or that kept failing): the sender is told they are done
-    fin = fin_ok | skipped; legacy = peer in LEGACY            # legacy: this sender ignores the "done" list, so it must be told "I already hold every byte" instead
-    offs, parts, mds = {}, {}, {}
+    fin = FINISHED.get(key, set()) & {f.get("id") for f in files}
+    offs, parts = {}, {}
     for f in files:
-        if f.get("t") != "file": continue
-        if f["id"] in fin:
-            if legacy: offs[f["id"]] = f["size"]
-            continue
+        if f.get("t") != "file" or f["id"] in fin: continue
         p = os.path.join(pdir, re.sub(r"[^0-9A-Za-z]", "", str(f["id"]))[:40] + ".part"); parts[f["id"]] = p
         n = os.path.getsize(lp(p)) if os.path.exists(lp(p)) else 0
         if n > f["size"]: _rm(p); n = 0
-        elif n:
-            was = n; n, mds[f["id"]], damaged = verify_part(p)
-            if damaged: ctl.log(f"Repaired {f['path']}: damage found in the partial file, keeping the verified {hsize(n)} and downloading the rest again")
         offs[f["id"]] = n
     ctl.parts = list(parts.values())
     total_left = sum(f["size"] for f in files if f.get("t") == "file" and f["id"] not in fin)
     if shutil.disk_usage(root).free < total_left - sum(offs.values()):
         sock.sendall(b"ERR not enough free space\n"); raise IOError("not enough free space")
-    blk_mode = "blk" in (h.get("caps") or [])      # the sender can append a checksum after every block: we verify each block the moment it arrives
-    sock.sendall(b"OK\n" + json.dumps({"off": offs, "done": [] if legacy else sorted(fin), **({"blk": CHK} if blk_mode else {})}).encode() + b"\n")
-    total -= sum(f["size"] for f in files if f.get("t") == "file" and f["id"] in skipped)
-    done = sum(n for i, n in offs.items() if i in parts) + sum(f["size"] for f in files if f.get("t") == "file" and f["id"] in fin_ok); ctl.start(done)
-    ctl.set_files([f["path"] if f["t"] == "file" else "Text message" for f in files], [f.get("size", 0) for f in files]); ctl.fids = [f["id"] for f in files]
+    sock.sendall(b"OK\n" + json.dumps({"off": offs, "done": sorted(fin)}).encode() + b"\n")
+    done = sum(offs.values()) + sum(f["size"] for f in files if f.get("t") == "file" and f["id"] in fin); ctl.start(done)
+    ctl.set_files([f["path"] if f["t"] == "file" else "Text message" for f in files], [f.get("size", 0) for f in files])
     for ix, f in enumerate(files):
-        if f["id"] in skipped: ctl.fstate[ix] = "skipped"
-        elif f["t"] == "file": ctl.fdone[ix] = f["size"] if f["id"] in fin else offs[f["id"]]
+        if f["t"] == "file": ctl.fdone[ix] = f["size"] if f["id"] in fin else offs[f["id"]]
         elif f["id"] in fin: ctl.fdone[ix] = ctl.sizes[ix]
-
-    def hashline(f):
-        """The checksum line after a file's bytes. Anything else means the stream is out of step - say so instead of crashing on binary data."""
-        b = r.readline(65)
-        if len(b) == 65 and b[64:] == b"\n" and _HEX.fullmatch(b[:64]): return b[:64].decode()
-        if not b: raise ConnectionError("connection lost")
-        raise Desync(f"out of sync at '{f['path']}': the sender's data does not match the size it announced", f["id"])
     w = _Writer(ctl, dest, key); w.start()
     try:
         for idx, f in enumerate(files):
-            if f["id"] in fin:
-                if legacy and f.get("t") == "file": hashline(f)      # old sender: it still sends the checksum line of a file we already hold
-                continue
+            if f["id"] in fin: continue
             if f.get("t") == "text":
-                txt = str(f.get("text", ""))[:1_000_000]; ctl.text(peer, txt); ctl.hist("in", "text", len(txt.encode("utf-8", "replace")), peer); ctl.fdone[idx] = ctl.sizes[idx]; FINISHED.setdefault(key, set()).add(f["id"]); continue
+                txt = str(f.get("text", ""))[:1_000_000]; ctl.text(peer, txt); ctl.hist("in", "text", len(txt.encode()), peer); ctl.fdone[idx] = ctl.sizes[idx]; FINISHED.setdefault(key, set()).add(f["id"]); continue
             rel, size, off, part = f["path"], f["size"], offs[f["id"]], parts[f["id"]]
-            if idx in ctl.skip_req: raise Rerun(f"skipped {rel}")
             if off: ctl.log(f"Resuming {rel} from {hsize(off)}")
-            w.put(("start", part, off, mds.get(f["id"]))); left = size - off; pos = off; bmd = hashlib.sha256()
+            w.put(("start", part, off)); left = size - off
             while left:
-                if idx in ctl.skip_req: raise Rerun(f"skipped {rel}")
-                b = r.read(min(BUF, left, CHK - pos % CHK))      # never read across a block boundary
+                b = r.read(min(BUF, left))
                 if not b: raise ConnectionError("connection lost")
-                left -= len(b); pos += len(b); done += len(b); ctl.fdone[idx] = size - left; w.put(("data", b)); ctl.tick(done, total)
-                if blk_mode:
-                    bmd.update(b)
-                    if pos % CHK == 0 or not left:               # end of a block: its checksum follows
-                        if hashline(f) != bmd.hexdigest(): raise BlockBad(f"'{rel}'", f["id"], (pos - 1) // CHK * CHK)
-                        bmd = hashlib.sha256()
-            w.put(("fin", hashline(f), part, rel, size, idx, f["id"]))
+                left -= len(b); done += len(b); ctl.fdone[idx] = size - left; w.put(("data", b)); ctl.tick(done, total)
+            w.put(("fin", readline(r).decode(), part, rel, size, idx, f["id"]))
         w.finish()
         if w.err: raise w.err
-        sock.sendall(b"DONE\n"); ctl.progress(total, total, 0, 0); FINISHED.pop(key, None); SKIP.pop(key, None)
-        for k_ in [k_ for k_ in BAD if k_[0] == key]: BAD.pop(k_, None)
+        sock.sendall(b"DONE\n"); ctl.progress(total, total, 0, 0); FINISHED.pop(key, None)
         try: os.rmdir(pdir)      # nothing left in the cache: remove the folder too
         except OSError: pass
     except BaseException as e:
         w.finish()
         if isinstance(e, InterruptedError): APPROVED.pop(key, None); CANCELLED[key] = time.time()
-        if isinstance(e, Rerun):      # the user cancelled file(s): remember them, drop their partial data, and let the sender reconnect without them
-            for ix in ctl.skip_req: SKIP.setdefault(key, set()).add(ctl.fids[ix])
-            for i in SKIP.get(key, ()): _rm(parts.get(i, ""))
-        elif isinstance(e, BlockBad):                       # damaged in transit: keep everything before the bad block, fetch from there again
-            _cut_part(parts.get(e.fid, ""), e.start)
-            c_ = BAD[(key, e.fid, e.start)] = BAD.get((key, e.fid, e.start), 0) + 1
-            tot = sum(v for k_, v in BAD.items() if len(k_) == 3 and k_[:2] == (key, e.fid))
-            if c_ >= 5 or tot >= 40: SKIP.setdefault(key, set()).add(e.fid); _rm(parts.get(e.fid, "")); e = BlockBad(f"data keeps arriving damaged in {e} at {hsize(e.start)} - file skipped, the rest continues", e.fid, e.start)
-            else: e = BlockBad(f"data damaged in transit in {e} at {hsize(e.start)} - repairing: fetching again from that point (repair {tot})", e.fid, e.start)
-        elif isinstance(e, Mismatch):                       # the file is re-sent from zero once; if it fails again it is skipped instead of looping forever
-            BAD[(key, e.fid)] = BAD.get((key, e.fid), 0) + 1; tries = BAD[(key, e.fid)]
-            if tries >= 3: SKIP.setdefault(key, set()).add(e.fid); e = Mismatch(f"{e} (3 times) - file skipped, the rest continues. It may be changing while it is read, or unreadable on the sender", e.fid)
-            else: e = Mismatch(f"{e} - repairing: downloading it again from scratch (attempt {tries + 1}/3)", e.fid)
-        elif isinstance(e, UnicodeError):
-            e = Desync(f"unreadable text from the sender at {where(e)} ({type(e).__name__}) [build {BUILD}]", None)
-        elif isinstance(e, Desync):
-            if not legacy and any(f.get("t") == "file" and f["id"] in fin for f in files):    # first suspect: a sender that ignores the "done" list
-                LEGACY.add(peer); e = Desync(f"{e} - retrying in compatibility mode", e.fid)
-            else:                                                                           # same file went wrong twice: give up on that one file, keep the rest
-                BAD[(key, e.fid)] = BAD.get((key, e.fid), 0) + 1
-                if BAD[(key, e.fid)] >= 2: SKIP.setdefault(key, set()).add(e.fid); _rm(parts.get(e.fid, "")); e = Desync(f"{e} - that file was skipped, the rest continues", e.fid)
         try: sock.sendall(b"ERR paused\n" if isinstance(e, Paused) else f"ERR {e}\n".encode())
         except OSError: pass
         if ctl.discard:
             for p in parts.values(): _rm(p)
-        raise e
+        raise
 
 
 # ---------- send (disk reader + hasher and the network sender run in parallel) ----------
@@ -495,7 +352,7 @@ def collect(paths):
 def text_item(txt): return {"t": "text", "text": txt, "rel": "text", "size": len(txt.encode())}
 
 
-def _producer(items, offs, dones, q, stop, blk=0):
+def _producer(items, offs, dones, q, stop):
     def put(m):
         while not stop.is_set():
             try: q.put(m, timeout=.5); return
@@ -511,15 +368,12 @@ def _producer(items, offs, dones, q, stop, blk=0):
                     b = f.read(min(BUF, left))
                     if not b: raise IOError("file changed while sending: " + it["rel"])
                     md.update(b); left -= len(b)
-                put(("start", ix, off)); left = it["size"] - off; pos = off; bmd = hashlib.sha256()
+                put(("start", ix, off)); left = it["size"] - off
                 while left:
                     if stop.is_set(): return
-                    b = f.read(min(BUF, left, (blk - pos % blk) if blk else BUF))
+                    b = f.read(min(BUF, left))
                     if not b: raise IOError("file shrank while sending: " + it["rel"])
-                    md.update(b); left -= len(b); pos += len(b); put(("data", ix, b))
-                    if blk:
-                        bmd.update(b)
-                        if pos % blk == 0 or not left: put(("bhash", ix, bmd.hexdigest())); bmd = hashlib.sha256()
+                    md.update(b); left -= len(b); put(("data", ix, b))
             put(("hash", ix, md.hexdigest()))
         put(("end",))
     except BaseException as e: put(("err", e))
@@ -539,9 +393,11 @@ def send_once(host, port, items, ctl, dest=""):
 
 def _send_over(s, r, items, ctl, dest, host):
     """The sender side of HSH3 on an already-connected socket (used for normal sends and for reverse connections)."""
-    cfg, man, total = ctl.cfg, [], 0
-    all_items = items; live = [(ox, it) for ox, it in enumerate(all_items) if ox not in ctl.gone]     # rows removed by a per-file cancel are not announced any more
-    items, omap = [it for _, it in live], [ox for ox, _ in live]
+    cfg, man, total, seen, uniq = ctl.cfg, [], 0, set(), []
+    for it in items:   # the same file picked twice would corrupt resume bookkeeping
+        k = fid(it["rel"], it["size"], it["mtime"]) if it["t"] == "file" else None
+        if k is None or k not in seen: uniq.append(it); seen.add(k)
+    items = uniq
     for n, it in enumerate(items):
         if it["t"] == "text": man.append({"id": f"t{n}", "t": "text", "path": "text", "size": it["size"], "text": it["text"]})
         else:
@@ -549,35 +405,30 @@ def _send_over(s, r, items, ctl, dest, host):
             man.append({"id": it["id"], "t": "file", "path": it["rel"].replace("\\", "/"), "size": it["size"]})
     stop = threading.Event(); th = None
     try:
-        s.sendall(b"HSH3\n" + json.dumps({"name": cfg["name"], "pin": cfg["pin"], "dest": dest, "files": man, "caps": ["blk"]}).encode() + b"\n")
+        s.sendall(b"HSH3\n" + json.dumps({"name": cfg["name"], "pin": cfg["pin"], "dest": dest, "files": man}).encode() + b"\n")
         resp = readline(r)
         if resp.startswith(b"ERR"):
             msg = resp[4:].decode("utf-8", "replace")
             raise PeerPaused(msg) if msg == "paused" else PermissionError(msg)
         if resp != b"OK": raise PermissionError("Receiver declined (or PIN mismatch)")
         ctl.connected = True; s.settimeout(300); ctl.set_state("running", "")
-        reply = json.loads(readline(r, MAXH).decode("utf-8", "replace")); offs, dones = reply["off"], set(reply.get("done", [])); blk = int(reply.get("blk", 0) or 0)
+        reply = json.loads(readline(r, MAXH)); offs, dones = reply["off"], set(reply.get("done", []))
         done = sum(offs.values()) + sum(it["size"] for it in items if it["t"] == "file" and it["id"] in dones); ctl.start(done)
-        if len(ctl.names) != len(all_items): ctl.set_files(["Text message" if it["t"] == "text" else it["rel"] for it in all_items], [it["size"] for it in all_items])   # first connection only: later ones keep the rows
+        ctl.set_files(["Text message" if it["t"] == "text" else it["rel"] for it in items], [it["size"] for it in items])
         for ix, it in enumerate(items):
-            if it["t"] == "file": ctl.fdone[omap[ix]] = it["size"] if it["id"] in dones else min(max(int(offs.get(it["id"], 0)), 0), it["size"])
-        q = queue.Queue(maxsize=8); th = threading.Thread(target=_producer, args=(items, offs, dones, q, stop, blk), daemon=True); th.start()
+            if it["t"] == "file": ctl.fdone[ix] = it["size"] if it["id"] in dones else min(max(int(offs.get(it["id"], 0)), 0), it["size"])
+        q = queue.Queue(maxsize=8); th = threading.Thread(target=_producer, args=(items, offs, dones, q, stop), daemon=True); th.start()
         while True:
             m = q.get(); k = m[0]
             if k == "end": break
             if k == "err": raise m[1]
-            ix = m[1]; ox = omap[ix]
-            if k == "skip": ctl.fdone[ox] = items[ix]["size"]; ctl.fsent.add(ox)
-            elif k == "start":
-                if ox in ctl.skip_req: raise Rerun("file cancelled")
-                ctl.fdone[ox] = m[2]
-            elif k == "data":
-                if ox in ctl.skip_req: raise Rerun("file cancelled")
-                s.sendall(m[2]); done += len(m[2]); ctl.fdone[ox] += len(m[2]); ctl.tick(done, total)
-            elif k == "bhash": s.sendall(m[2].encode() + b"\n")
-            elif k == "hash": s.sendall(m[2].encode() + b"\n"); ctl.fdone[ox] = items[ix]["size"]; ctl.fsent.add(ox)
+            ix = m[1]
+            if k == "skip": ctl.fdone[ix] = items[ix]["size"]
+            elif k == "start": ctl.fdone[ix] = m[2]
+            elif k == "data": s.sendall(m[2]); done += len(m[2]); ctl.fdone[ix] += len(m[2]); ctl.tick(done, total)
+            elif k == "hash": s.sendall(m[2].encode() + b"\n"); ctl.fdone[ix] = items[ix]["size"]
         s.settimeout(1800)       # the receiver may spend minutes moving / virus-scanning a big file before it says DONE: that is NOT a dead connection
-        res = readline(r).decode("utf-8", "replace")
+        res = readline(r).decode()
         if res == "ERR paused": raise PeerPaused("paused")
         if res != "DONE": raise IOError(res or "no reply")
         ctl.progress(total, total, 0, 0); ctl.log(f"Sent {len(items)} item(s), {hsize(total)} to {ctl.label or host}")
@@ -621,26 +472,11 @@ def _retry(ctl, attempt, deadline, e):
     return attempt, deadline
 
 
-def _dedupe(items):
-    """The same file picked twice would corrupt resume bookkeeping."""
-    seen, uniq = set(), []
-    for it in items:
-        k = fid(it["rel"], it["size"], it["mtime"]) if it["t"] == "file" else None
-        if k is None or k not in seen: uniq.append(it); seen.add(k)
-    return uniq
-
-
 def send(host, port, items, ctl, dest=""):
     """Sends everything; reconnects and resumes on its own for up to cfg['reconnect_s'] seconds. Raises Paused / ConnectionLost (resumable)."""
-    attempt, deadline = 0, None; items = _dedupe(items)
+    attempt, deadline = 0, None
     while True:
         try: return send_once(host, port, items, ctl, dest)
-        except Rerun:         # a file was cancelled: leave it (and everything already delivered) out and send the rest as a fresh, smaller transfer
-            for ox in ctl.skip_req: ctl.gone.add(ox)
-            ctl.skip_req.clear(); ctl.gone.update(ox for ox in ctl.fsent if ox < len(items))
-            if ctl.job: ctl.job["items"] = [it for ox, it in enumerate(items) if ox not in ctl.gone]; save_job(ctl.job)
-            if len(ctl.gone) >= len(items): ctl.progress(1, 1, 0, 0); return
-            attempt, deadline = 0, None
         except (PermissionError, InterruptedError, Paused): raise
         except PeerPaused:
             ctl.set_state("waiting", "Paused by the receiver - waiting for it to resume"); _wait(ctl, 2)
