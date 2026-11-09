@@ -99,6 +99,13 @@ class MainActivity : Activity(), Core.Ui {
         dlg().setTitle("Keep transfers running with the screen off").setMessage("Android cuts off network access for background apps when the screen turns off, which stops transfers. Allow HotShare to ignore battery optimisation so transfers continue while your phone sleeps.")
             .setPositiveButton("Allow") { _, _ -> requestBattery() }.setNegativeButton("Not now", null).show()
     }
+    /** First launch: say where received files go and offer to pick the folder (before this the default was a fixed folder, hidden under Android/data on Android 8-9). */
+    private fun askSaveFolderOnce() {
+        if (Core.prefs.getString("tree", null) != null || Core.prefs.getBoolean("folder_asked", false)) return
+        Core.prefs.edit().putBoolean("folder_asked", true).apply()
+        dlg().setTitle("Where should received files be saved?").setMessage("Right now they go to " + savePathText() + ". Pick a folder (for example Downloads or your SD card) to save them there instead. You can change it any time under \"Receive into\".")
+            .setPositiveButton("Choose folder") { _, _ -> startActivityForResult(treeIntent(), 3) }.setNegativeButton("Keep default", null).show()
+    }
     private fun subtitle() = "${Core.cfg("name", Build.MODEL)}   -   ${Core.localIps().firstOrNull() ?: "not connected"}"
     private fun treeIntent() = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
 
@@ -138,7 +145,7 @@ class MainActivity : Activity(), Core.Ui {
         val info = col(); infoTv = tv("Nothing to send yet", 15f, C.text, true); subInfo = tv("Select a device above", 12f, C.muted).apply { setPadding(0, dp(3), 0, 0) }
         info.addView(infoTv); info.addView(subInfo); bar.addView(info, LinearLayout.LayoutParams(0, -2, 1f))
         bar.addView(chip("send", "Send", true) { sendQueue() }.apply { setPadding(dp(22), dp(14), dp(22), dp(14)) })
-        frame.addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM)); setContentView(frame)
+        frame.addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM)); setContentView(frame); frame.post { askSaveFolderOnce() }
 
         // header: logo, title, radar, history, settings
         val head = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }

@@ -110,3 +110,48 @@ def fix_firewall():
            f'netsh advfirewall firewall add rule name="{RULE}" dir=in action=allow program="{exe}" enable=yes profile=any')
     try: return ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", f"/c {cmd}", None, 0) > 32
     except Exception: return False
+
+
+# ---------- taskbar button progress (green bar on the app's taskbar icon) ----------
+class Taskbar:
+    """ITaskbarList3 through ctypes (no extra packages). Every method is a safe no-op on other systems or on failure."""
+    NONE, INDETERMINATE, NORMAL, ERROR, PAUSED = 0, 1, 2, 4, 8
+
+    def __init__(s, win):
+        s.ok, s.win, s.hwnd, s.ptr, s.vt, s.state, s.val = False, win, None, None, None, None, None
+        if not IS_WIN: return
+        try:
+            from ctypes import wintypes
+            class GUID(ctypes.Structure): _fields_ = [("a", ctypes.c_uint32), ("b", ctypes.c_uint16), ("c", ctypes.c_uint16), ("d", ctypes.c_ubyte * 8)]
+            def guid(a, b, c, *d): g = GUID(); g.a, g.b, g.c = a, b, c; g.d[:] = d; return g
+            ole = ctypes.windll.ole32; ole.CoInitialize(None)
+            clsid = guid(0x56FDF344, 0xFD6D, 0x11D0, 0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90)
+            iid = guid(0xEA1AFB91, 0x9E28, 0x4B86, 0x90, 0xE9, 0x9E, 0x9F, 0x8A, 0x5E, 0xEF, 0xAF)
+            ole.CoCreateInstance.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+            p = ctypes.c_void_p()
+            if ole.CoCreateInstance(ctypes.byref(clsid), None, 1, ctypes.byref(iid), ctypes.byref(p)) != 0 or not p.value: return
+            s.ptr = p; s.vt = ctypes.cast(ctypes.cast(p, ctypes.POINTER(ctypes.c_void_p))[0], ctypes.POINTER(ctypes.c_void_p))
+            hr = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(s.vt[3]); hr(p)                                   # HrInit
+            s._val = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wintypes.HWND, ctypes.c_ulonglong, ctypes.c_ulonglong)(s.vt[9])     # SetProgressValue
+            s._st = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wintypes.HWND, ctypes.c_int)(s.vt[10])                               # SetProgressState
+            s.ok = True
+        except Exception:
+            s.ok = False
+
+    def _h(s):
+        if s.hwnd is None:
+            try: s.win.update_idletasks(); s.hwnd = ctypes.windll.user32.GetParent(s.win.winfo_id()) or s.win.winfo_id()
+            except Exception: return None
+        return s.hwnd
+
+    def set(s, state, done=0, total=0):
+        """state: NONE / INDETERMINATE / NORMAL / ERROR / PAUSED. done/total only matter for the bar states."""
+        if not s.ok: return
+        try:
+            h = s._h()
+            if not h: return
+            if state != s.state and s._st(s.ptr, h, state) == 0: s.state = state       # not cached when Windows refused (e.g. the taskbar button does not exist yet)
+            if state in (s.NORMAL, s.ERROR, s.PAUSED) and total:
+                v = min(1000, int(1000 * done / total))
+                if v != s.val and s._val(s.ptr, h, v, 1000) == 0: s.val = v
+        except Exception: pass

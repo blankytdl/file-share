@@ -308,6 +308,24 @@ object Core {
         }
         sock.use { sendStream(BufferedInputStream(rin, BUF), BufferedOutputStream(rout, BUF), items, dest, t, dev.name, plain) }
     }
+    /** Recovery data (like a RAR recovery record) for ONE file, built only when the receiver asks for it: one XOR parity block per `group` blocks, each followed by its SHA-256. One block in memory at a time. */
+    private fun sendParity(item: Item, chk: Int, group: Int, out: OutputStream) {
+        if (chk <= 0 || group <= 0) return
+        val size = item.size; val blocks = (size + chk - 1) / chk; val groups = ((blocks + group - 1) / group).toInt(); val buf = ByteArray(BUF)
+        item.open().use { s ->
+            for (g in 0 until groups) {
+                val acc = ByteArray(chk); val g0 = g.toLong() * group * chk; val end = minOf(size, g0 + group.toLong() * chk); var pos = g0
+                while (pos < end) {
+                    val o = (pos % chk).toInt(); val n = s.read(buf, 0, minOf(buf.size.toLong(), end - pos, (chk - o).toLong()).toInt()); if (n < 0) throw IOException("file changed while building recovery data")
+                    for (k in 0 until n) acc[o + k] = (acc[o + k].toInt() xor buf[k].toInt()).toByte()
+                    pos += n
+                }
+                val want = minOf(chk.toLong(), size - g0).toInt(); val p = if (acc.size == want) acc else acc.copyOf(want)
+                out.write(p); out.write((hex(MessageDigest.getInstance("SHA-256").digest(p)) + "\n").toByteArray())
+            }
+        }
+    }
+
     /** The sender side of HSH3 on an open connection (used for normal sends and for connections the other device opened to us). */
     private fun sendStream(inp: InputStream, out: OutputStream, items: List<Item>, dest: String, t: Transfer, devName: String, plain: Socket?) {
         val man = JSONArray(); val ids = HashMap<Item, String>(); val sent = ArrayList<Item>(); var total = 0L
@@ -315,12 +333,12 @@ object Core {
             if (item.text != null) { man.put(JSONObject().put("id", "t${sent.size}").put("t", "text").put("path", "text").put("size", item.size).put("text", item.text)); sent.add(item) }
             else { val id = fid(item.rel, item.size, item.mtime); if (ids.containsValue(id)) continue; ids[item] = id; sent.add(item); total += item.size; man.put(JSONObject().put("id", id).put("t", "file").put("path", item.rel).put("size", item.size)) }
         }
-        out.write("HSH3\n${JSONObject().put("name", cfg("name", Build.MODEL)).put("pin", cfg("pin")).put("dest", dest).put("files", man)}\n".toByteArray()); out.flush()
+        out.write("HSH3\n${JSONObject().put("name", cfg("name", Build.MODEL)).put("pin", cfg("pin")).put("dest", dest).put("files", man).put("caps", "blk,rep")}\n".toByteArray()); out.flush()
         val resp = readLine(inp)
         if (resp.startsWith("ERR")) { val m = resp.drop(4); throw if (m == "paused") PeerPaused(m) else Declined(m) }
         if (resp != "OK") throw Declined("$devName declined (or PIN mismatch)")
         t.connectedOnce = true; plain?.soTimeout = 300000; setState(t, "running", "")
-        val reply = JSONObject(readLine(inp, MAXH)); val offs = reply.getJSONObject("off"); val dones = HashSet<String>()
+        val reply = JSONObject(readLine(inp, MAXH)); val offs = reply.getJSONObject("off"); val dones = HashSet<String>(); val blk = reply.optLong("blk", 0L); val rec = reply.optInt("rep", 0)   // blk > 0: the receiver verifies every block, so a checksum line follows each one
         reply.optJSONArray("done")?.let { a -> for (i in 0 until a.length()) dones.add(a.getString(i)) }          // files the receiver has ALREADY SAVED: never resend them
         var done = 0L; for ((x, id) in ids) done += if (id in dones) x.size else offs.optLong(id, 0)
         t.total = total; t.base = done; t.t0 = System.currentTimeMillis(); val buf = ByteArray(BUF); val md = MessageDigest.getInstance("SHA-256")
@@ -332,13 +350,24 @@ object Core {
             val off = offs.optLong(id, 0).coerceIn(0, item.size); md.reset()
             item.open().use { s ->
                 var left = off; while (left > 0) { val n = s.read(buf, 0, minOf(buf.size.toLong(), left).toInt()); if (n < 0) throw IOException("file changed"); md.update(buf, 0, n); left -= n }
-                left = item.size - off
-                while (left > 0) { val n = s.read(buf, 0, minOf(buf.size.toLong(), left).toInt()); if (n < 0) throw IOException("file shrank"); out.write(buf, 0, n); md.update(buf, 0, n); left -= n; done += n; t.fdone[ix] = item.size - left; tick(t, done) }
+                if (blk > 0L && off > 0L) out.write((hex((md.clone() as MessageDigest).digest()) + "\n").toByteArray())   // checksum of the part the receiver already holds, so it can notice a changed file before downloading the rest
+                left = item.size - off; var pos = off; val bmd = MessageDigest.getInstance("SHA-256")
+                while (left > 0) {
+                    val room = if (blk > 0L) minOf(left, blk - pos % blk) else left          // never cross a block boundary
+                    val n = s.read(buf, 0, minOf(buf.size.toLong(), room).toInt()); if (n < 0) throw IOException("file shrank")
+                    out.write(buf, 0, n); md.update(buf, 0, n); left -= n; pos += n; done += n; t.fdone[ix] = item.size - left; tick(t, done)
+                    if (blk > 0L) { bmd.update(buf, 0, n); if (pos % blk == 0L || left == 0L) out.write((hex(bmd.digest()) + "\n").toByteArray()) }   // digest() also resets for the next block
+                }
             }
             out.write((hex(md.digest()) + "\n").toByteArray()); t.fdone[ix] = item.size
         }
         out.flush(); plain?.soTimeout = 1800000          // the receiver may spend minutes saving a big file before it says DONE: that is not a dead connection
-        val r = readLine(inp)
+        var r = readLine(inp)
+        while (r.startsWith("REPAIR ")) {      // the receiver found damaged blocks in some files and wants recovery data for those files only
+            val want = JSONObject(r.substring(7)).getJSONArray("files")
+            for (k in 0 until want.length()) { val id = want.getString(k); val item = sent.firstOrNull { it.text == null && ids[it] == id } ?: continue; sendParity(item, blk.toInt(), rec, out) }
+            out.flush(); r = readLine(inp)
+        }
         if (r == "ERR paused") throw PeerPaused("paused")
         if (r != "DONE") throw IOException(r.ifEmpty { "no reply" })
         tick(t, total); sent.forEach { history("out", it.rel, it.size, devName) }

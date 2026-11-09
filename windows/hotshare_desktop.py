@@ -221,10 +221,10 @@ class QueueRow(RCard):
 
 
 class XCard(RCard):
-    MAXROWS = 40
+    MAXROWS = 80
 
-    def __init__(s, parent, title, up, on_cancel, on_pause):
-        super().__init__(parent, pad=14); i = s.inner; s.rows, s.sizes, s.open, s.cancel_cb, s.pause_cb, s.mode = [], [], False, on_cancel, on_pause, "run"
+    def __init__(s, parent, title, up, on_cancel, on_pause, on_file=None):
+        super().__init__(parent, pad=14); i = s.inner; s.rows, s.sizes, s.open, s.cancel_cb, s.pause_cb, s.mode, s.file_cb = [], [], False, on_cancel, on_pause, "run", on_file
         top = tk.Frame(i, bg=P["card"]); top.pack(fill="x")
         Icon(top, "upload" if up else "download", 22, P["accent"], P["card"]).pack(side="left")
         s.title = tk.Label(top, text=title, bg=P["card"], fg=P["text"], font=F(11, True)); s.title.pack(side="left", padx=(px(10), 0))
@@ -240,6 +240,8 @@ class XCard(RCard):
     def set_mode(s, mode):
         if mode == s.mode: return
         s.mode = mode
+        if mode != "run":
+            for r in s.rows: r["x"].pack_forget()          # per-file cancel only makes sense while the transfer runs
         if mode == "done": s.pbtn.pack_forget(); return
         s.pbtn.pack(side="right", padx=(0, px(12)))
         s.pbtn.show("play", P["ok"]) if mode == "paused" else s.pbtn.show("pause", P["text"])
@@ -253,8 +255,10 @@ class XCard(RCard):
             mid = tk.Frame(f, bg=P["card"]); mid.pack(side="left", fill="x", expand=True, padx=px(10))
             tk.Label(mid, text=short(names[k], 56), bg=P["card"], fg=P["text"], font=F(9), anchor="w").pack(anchor="w")
             bar = Bar(mid, h=5); bar.pack(fill="x", pady=(px(3), 0))
-            st = tk.Label(f, text="", bg=P["card"], fg=P["muted"], font=F(9), width=7, anchor="e"); st.pack(side="right")
-            s.rows.append(dict(ic=ic, bar=bar, st=st, last=-1, done=False))
+            x = Icon(f, "close", 14, P["muted"], P["card"]); x.configure(cursor="hand2"); x.bind("<Button-1>", lambda e, k=k: s.file_cb and s.file_cb(k))     # cancel just this file
+            if s.mode == "run" and s.file_cb: x.pack(side="right", padx=(px(6), 0))
+            st = tk.Label(f, text="", bg=P["card"], fg=P["muted"], font=F(9), width=8, anchor="e"); st.pack(side="right")
+            s.rows.append(dict(ic=ic, bar=bar, st=st, x=x, last=-1, done=False))
         if n > s.MAXROWS: tk.Label(s.fbox, text=f"... and {n - s.MAXROWS} more", bg=P["card"], fg=P["muted"], font=F(9)).pack(anchor="w", pady=px(4))
         s.open = n <= 4; s._show()
 
@@ -265,15 +269,19 @@ class XCard(RCard):
 
     def toggle(s): s.open = not s.open; s._show()
 
-    def update_files(s, fdone, all_done=False):
+    def update_files(s, fdone, all_done=False, fstate=None):
+        fstate = fstate or {}
         for k, r in enumerate(s.rows):
+            if k in fstate:                                  # cancelled by the user (or given up on): shown as skipped, never as an error
+                if r["last"] != -3: r["last"] = -3; r["bar"].set(0); r["st"].configure(text="Skipped", fg=P["warn"]); r["ic"].show("close", P["warn"]); r["x"].pack_forget()
+                continue
             size, d = s.sizes[k], (fdone[k] if k < len(fdone) else 0); done = all_done or (size > 0 and d >= size)
             key = -2 if done else (int(100 * d / size) if size else 0)
             if key == r["last"]: continue
             r["last"] = key
             if done:
                 r["bar"].set(1, True); r["st"].configure(text="Done", fg=P["ok"])
-                if not r["done"]: r["done"] = True; r["ic"].show("check", P["ok"])
+                if not r["done"]: r["done"] = True; r["ic"].show("check", P["ok"]); r["x"].pack_forget()
             else:
                 r["bar"].set(d / size if size else 0); r["st"].configure(text=f"{key}%" if size else "", fg=P["muted"])
 
@@ -283,13 +291,14 @@ def main():
     WIN.dpi_aware()
     cfg = H.load_cfg(); os.makedirs(cfg["folder"], exist_ok=True); H.clean_partials(cfg["folder"])
     cfg["theme"] = {"dark": "Midnight", "light": "Daylight"}.get(cfg["theme"], cfg["theme"])
-    root = tk.Tk(); root.title("HotShare"); SC[0] = max(1.0, float(root.winfo_fpixels("1i")) / 96.0); FONT[0] = pick_font(root); apply_theme(cfg["theme"])
+    root = tk.Tk(); root.title(f"HotShare  ·  {H.BUILD}"); SC[0] = max(1.0, float(root.winfo_fpixels("1i")) / 96.0); FONT[0] = pick_font(root); apply_theme(cfg["theme"])
     root.geometry(f"{px(1080)}x{px(740)}"); root.minsize(px(900), px(600))
     try: root.iconbitmap(res("icon.ico"))
     except Exception:
         try: root.iconphoto(True, tk.PhotoImage(file=res("logo2.png")))
         except Exception: pass
     q = queue.Queue(); devices, cards, done_, active, selected, queue_, W = {}, {}, {}, [], set(), [], {}
+    TB, TBERR = WIN.Taskbar(root), [0.0]      # progress bar on the taskbar icon / time of the last failure (the bar turns red for a few seconds)
 
     def ui(fn, *a): q.put((fn, a))
     def pump():
@@ -387,18 +396,33 @@ def main():
     def title_of(c): return ("From " if c.incoming and c.label != "Incoming" else "") + c.label
 
     def make_card(c):
-        card = XCard(W["xbox"], title_of(c), not c.incoming, lambda: discard(c), lambda: toggle_pause(c)); card.pack(fill="x", pady=px(6)); cards[c] = card; return card
+        card = XCard(W["xbox"], title_of(c), not c.incoming, lambda: discard(c), lambda: toggle_pause(c), lambda k: cancel_file(c, k)); card.pack(fill="x", pady=px(6)); cards[c] = card; return card
+
+    def cancel_file(c, k):   # the small X on one file row: skip that file, the rest of the transfer carries on
+        if c in done_ or c not in active: return
+        if c.cancel_file(k): toast(f"Skipping {short(c.names[k], 40)}" + (" - reconnecting without it" if c.incoming or c.job else ""))
+
+    def update_taskbar():
+        if time.monotonic() - TBERR[0] < 6: return TB.set(TB.ERROR, 1, 1)
+        if not active: return TB.set(TB.NONE)
+        d, t = sum(c.last[0] for c in active), sum(c.last[1] for c in active)
+        if all(c.state in ("waiting", "reconnecting") for c in active): TB.set(TB.PAUSED, d, t) if t else TB.set(TB.INDETERMINATE)
+        elif t: TB.set(TB.NORMAL, d, t)
+        else: TB.set(TB.INDETERMINATE)
 
     def update_speed():
+        update_taskbar()
         if W.get("speed") is not None and W["speed"].winfo_exists():
             W["speed"].configure(text=f"{H.hsize(sum(c.last[2] for c in active if c.state not in ('waiting', 'reconnecting')))}/s   -   {len(active)} active" if active else "Idle")
 
     def on_files(c):
-        card = cards.get(c) or make_card(c); card.title.configure(text=title_of(c)); card.set_files(c.names, c.sizes)
+        card = cards.get(c) or make_card(c); card.title.configure(text=title_of(c)); card.set_files(c.names, c.sizes); card.update_files(c.fdone, fstate=c.fstate)
+        if c.incoming and c.key:     # a reconnect of the same transfer replaces its earlier "stopped" card instead of stacking a new one
+            for old in [o for o, (st, _) in done_.items() if o is not c and o.incoming and o.key == c.key and st != "paused"]: remove_card(old)
 
     def on_prog(c, d, t, sp, eta):
         card = cards.get(c) or make_card(c); card.title.configure(text=title_of(c)); card.bar.set(d / t if t else 0)
-        card.stat.configure(text=f"{H.hsize(d)} of {H.hsize(t)}   -   {H.hsize(sp)}/s   -   {int(eta)}s left" if sp else "Finishing...", fg=P["muted"]); card.update_files(c.fdone); update_speed()
+        card.stat.configure(text=f"{H.hsize(d)} of {H.hsize(t)}   -   {H.hsize(sp)}/s   -   {int(eta)}s left" if sp else "Finishing...", fg=P["muted"]); card.update_files(c.fdone, fstate=c.fstate); update_speed()
 
     def on_state(c, st, msg):
         card = cards.get(c) or make_card(c)
@@ -410,7 +434,7 @@ def main():
         if card is not None and card.winfo_exists(): card.destroy()
 
     def paint_done(card, c, state, msg):
-        ok = state == "ok"; card.title.configure(text=title_of(c)); card.bar.set(1 if ok else card.bar.cur, done=ok); card.update_files(c.fdone, all_done=ok)
+        ok = state == "ok"; card.title.configure(text=title_of(c)); card.bar.set(1 if ok else card.bar.cur, done=ok); card.update_files(c.fdone, all_done=ok, fstate=c.fstate)
         word = {"ok": "Done - ", "paused": "Paused - ", "cancelled": "Cancelled - "}.get(state, "Stopped - ")
         card.stat.configure(text=word + msg, fg=P["ok"] if ok else (P["warn"] if state == "paused" else P["err"])); card.set_mode("paused" if state == "paused" else "done")
 
@@ -418,6 +442,82 @@ def main():
         card = cards.get(c) or make_card(c); done_[c] = (state, msg); paint_done(card, c, state, msg); update_speed()
         if state != "paused": root.after(15000, remove_card, c)
         if state == "ok" and c.got and cfg["open_after"] and c.incoming: open_inbox()
+        if state == "fail": TBERR[0] = time.monotonic(); update_taskbar(); root.after(6200, update_taskbar)
+        if state == "ok": show_summary(c)
+
+    # ------------------------------ completion summary ------------------------------
+    def reveal(path):
+        """Open the folder and select the file (Explorer); falls back to just opening the folder."""
+        try:
+            if not path: return open_inbox()
+            path = os.path.normpath(path)
+            if os.name == "nt":
+                import subprocess
+                if os.path.exists(path): subprocess.Popen(f'explorer /select,"{path}"')
+                else: os.startfile(os.path.dirname(path))
+            else: os.system(f'xdg-open "{os.path.dirname(path)}" &')
+        except OSError: pass
+
+    def summary_rows(c):
+        """One row per file of a finished transfer: name, size, status (ok / failed / skipped), reason, where it is on disk."""
+        rows, srcs = [], {it["rel"]: it.get("abs") for it in getattr(c, "orig_items", [])}
+        for ix, name in enumerate(c.names):
+            if name == "Text message": continue
+            size = c.sizes[ix] if ix < len(c.sizes) else 0; fid_ = c.fids[ix] if ix < len(c.fids) else None
+            if c.incoming:
+                path = c.report_saved.get(fid_)
+                if fid_ in c.report_failed: st, why = "failed", c.report_failed[fid_]
+                elif ix in c.fstate: st, why = "skipped", "skipped"
+                elif fid_ in c.report_repaired: n_ = c.report_repaired[fid_]; st, why = "ok", f"repaired from recovery data ({n_} damaged block{'s' if n_ != 1 else ''} rebuilt)"
+                else: st, why = "ok", ""
+            else:
+                path = srcs.get(name)
+                if ix in c.failed_ix: st, why = "failed", "the receiver could not get a correct copy"
+                elif ix in c.fstate or ix in c.gone: st, why = "skipped", "skipped"
+                elif ix in c.repaired_ix: st, why = "ok", "the receiver found damaged blocks; recovery data was sent and the file was repaired"
+                else: st, why = "ok", ("source file changed while it was being sent - this copy may be incomplete" if ix in c.changed_ix else "")
+            rows.append(dict(name=name, size=size, st=st, why=why, path=path, fixed=st == "ok" and ("repaired" in why or "recovery data was sent" in why)))
+        return rows
+
+    def show_summary(c):
+        rows = summary_rows(c)
+        if not rows or not cfg.get("summary", True): return
+        good = [r for r in rows if r["st"] == "ok"]; bad = [r for r in rows if r["st"] == "failed"]; skp = [r for r in rows if r["st"] == "skipped"]
+        verb = "received" if c.incoming else "sent"
+        d = dialog("Transfer complete" if not bad else "Transfer finished with problems"); d.geometry(f"{px(580)}x{px(600)}"); d.minsize(px(480), px(420))
+        Icon(d, "check" if not bad else "close", 36, P["ok"] if not bad else P["err"], P["bg"]).pack(pady=(px(20), px(4)))
+        label(d, f"{len(good)} of {len(rows)} file{'s' if len(rows) != 1 else ''} {verb}", 15, True, P["text"]).pack()
+        fixed = [r for r in rows if r["fixed"]]
+        parts = ([f"{len(bad)} failed"] if bad else []) + ([f"{len(fixed)} repaired with recovery data"] if fixed else []) + ([f"{len(skp)} skipped"] if skp else []) + [("from " if c.incoming else "to ") + c.label.replace("To ", "")]
+        label(d, "   -   ".join(parts), 9, False, P["err"] if bad else (P["warn"] if fixed else P["muted"])).pack(pady=(px(2), px(8)))
+        sf = ScrollFrame(d); sf.pack(fill="both", expand=True, padx=px(18), pady=(px(4), px(8)))
+        for r in sorted(rows, key=lambda r: {"failed": 0, "skipped": 1, "ok": 2}[r["st"]]):
+            col = P["warn"] if r["fixed"] else {"ok": P["ok"], "failed": P["err"], "skipped": P["warn"]}[r["st"]]
+            f = tk.Frame(sf.inner, bg=P["bg"]); f.pack(fill="x", pady=px(3))
+            Icon(f, {"ok": "check", "failed": "close", "skipped": "close"}[r["st"]], 16, col, P["bg"]).pack(side="left", anchor="n")
+            mid = tk.Frame(f, bg=P["bg"]); mid.pack(side="left", fill="x", expand=True, padx=px(10))
+            tk.Label(mid, text=short(r["name"], 58), bg=P["bg"], fg=P["text"], font=F(9), anchor="w").pack(anchor="w")
+            if r["why"]: tk.Label(mid, text=r["why"], bg=P["bg"], fg=P["warn"] if r["st"] == "ok" else col, font=F(8), anchor="w").pack(anchor="w")
+            if r["st"] == "ok" and r["path"]:
+                b = Icon(f, "folder", 16, P["muted"], P["bg"]); b.pack(side="right", padx=(px(6), 0)); b.configure(cursor="hand2"); b.bind("<Button-1>", lambda e, p=r["path"]: reveal(p))      # show this file in Explorer
+            tk.Label(f, text=H.hsize(r["size"]), bg=P["bg"], fg=P["muted"], font=F(9)).pack(side="right")
+        if bad and c.incoming: label(d, "Failed files were not saved. Send them again from the other device.", 9, False, P["warn"]).pack(padx=px(18), pady=(0, px(6)))
+        row = tk.Frame(d, bg=P["bg"]); row.pack(pady=(px(6), px(18)))
+        paths = [r["path"] for r in good if r["path"]]; dirs = {os.path.dirname(x) for x in paths}
+        try: folder = next(iter(dirs)) if len(dirs) == 1 else (os.path.commonpath(list(dirs)) if dirs else cfg["folder"])
+        except ValueError: folder = cfg["folder"]
+        def open_loc():
+            if len(paths) == 1: return reveal(paths[0])
+            try: os.startfile(folder) if os.name == "nt" else os.system(f'xdg-open "{folder}" &')
+            except OSError: pass
+        RBtn(row, "Open file location", open_loc, icon="folder", primary=not bad).pack(side="left", padx=px(4))
+        if bad and not c.incoming and getattr(c, "orig_items", None):
+            def retry():
+                names = {r["name"] for r in bad}; items = [dict(it) for it in c.orig_items if it["rel"] in names]; j = c.job or {}
+                d.destroy()
+                if items: start_job(H.new_job(j.get("host"), j.get("port"), j.get("name"), items, j.get("dest", ""))); toast(f"Sending {len(items)} failed file(s) again")
+            RBtn(row, f"Send {len(bad)} failed again", retry, icon="upload", primary=True).pack(side="left", padx=px(4))
+        RBtn(row, "Close", d.destroy).pack(side="left", padx=px(4))
 
     def hist(d, name, size, peer):
         cfg["history"] = (cfg["history"] + [[time.strftime("%Y-%m-%d %H:%M"), d, name, size, peer]])[-200:]
@@ -448,7 +548,7 @@ def main():
         remove_card(c)
 
     def start_job(job):
-        ctl = new_ctl("To " + job["name"], False); ctl.job = job; H.save_job(job)    # saved first: survives a crash / power cut
+        ctl = new_ctl("To " + job["name"], False); ctl.job = job; ctl.orig_items = [dict(it) for it in job["items"]]; H.save_job(job)    # saved first: survives a crash / power cut
         def w():
             try: H.send(job["host"], job["port"], job["items"], ctl, job["dest"]); H.drop_job(job["id"]); ui(finish, ctl, "ok", "sent")
             except InterruptedError: H.drop_job(job["id"]); ui(finish, ctl, "cancelled", "cancelled; cached data discarded")
@@ -504,11 +604,13 @@ def main():
         try:
             H.handle(c, ctl, r, first)
             if not ctl.silent and ctl.label != "Incoming":
-                ui(finish, ctl, "fail" if ctl.declined else "ok", "Declined" if ctl.declined else (f"received {ctl.got} file(s)" if ctl.got else "text received"))
+                ui(finish, ctl, "fail" if ctl.declined else "ok", "Declined" if ctl.declined else ((f"received {ctl.got} file(s)" if ctl.got else "text received") + (f", {len(ctl.fstate)} skipped" if ctl.fstate else "")))
+        except H.Rerun: ui(finish, ctl, "fail", "skipping the cancelled file - the sender reconnects without it")
+        except (H.Desync, H.Mismatch, H.BlockBad, H.Stale) as e: ui(finish, ctl, "fail", str(e))
         except H.Paused: ui(finish, ctl, "paused", "partial data kept. Press Resume and the sender continues")
         except InterruptedError: ui(finish, ctl, "cancelled", "cancelled; cached data discarded")
         except Exception as e:
-            if ctl.label != "Incoming" and not ctl.silent: ui(finish, ctl, "fail", f"{e} - partial data kept, the sender reconnects on its own")
+            if ctl.label != "Incoming" and not ctl.silent: ui(finish, ctl, "fail", f"{e} - partial data kept, the sender reconnects on its own [{H.BUILD}]")
         finally:
             try: c.close()
             except OSError: pass
@@ -617,23 +719,23 @@ def main():
 
     def settings():
         w = dialog("Settings")
-        v = {k: tk.StringVar(value=str(cfg[k])) for k in ("name", "folder", "port", "pin", "reconnect_s")}; b = {k: tk.BooleanVar(value=cfg[k]) for k in ("auto", "visible", "open_after")}
-        for i, (k, l) in enumerate((("name", "Device name"), ("folder", "Save folder"), ("port", "Port"), ("pin", "Shared PIN"), ("reconnect_s", "Keep reconnecting for (seconds)"))):
+        v = {k: tk.StringVar(value=str(cfg[k])) for k in ("name", "folder", "port", "pin", "reconnect_s", "rec_max_gb")}; b = {k: tk.BooleanVar(value=cfg[k]) for k in ("auto", "visible", "open_after", "recovery", "verify_disk", "summary")}
+        for i, (k, l) in enumerate((("name", "Device name"), ("folder", "Save folder"), ("port", "Port"), ("pin", "Shared PIN"), ("reconnect_s", "Keep reconnecting for (seconds)"), ("rec_max_gb", "Repair files up to (GB)"))):
             label(w, l).grid(row=i, column=0, sticky="w", padx=px(22), pady=px(7))
             tk.Entry(w, textvariable=v[k], width=34, bg=P["card2"], fg=P["text"], insertbackground=P["text"], relief="flat", font=F(10)).grid(row=i, column=1, padx=px(6), ipady=px(5))
         RBtn(w, "Browse", lambda: v["folder"].set(filedialog.askdirectory(parent=w) or v["folder"].get()), h=30, icon="folder").grid(row=1, column=2, padx=px(10))
-        for j, (k, l) in enumerate((("visible", "Visible to nearby devices"), ("auto", "Auto-accept everything"), ("open_after", "Open folder after receiving"))):
-            tk.Checkbutton(w, text=l, variable=b[k], bg=P["bg"], fg=P["text"], selectcolor=P["card"], activebackground=P["bg"], activeforeground=P["text"], font=F(10)).grid(row=5 + j, column=1, sticky="w", pady=px(2))
-        RBtn(w, f"Clear trusted devices ({len(cfg['trusted'])})", lambda: (cfg["trusted"].clear(), H.save_cfg(cfg)), h=30).grid(row=8, column=1, sticky="w", pady=px(8))
-        cl = label(w, f"Transfer cache: {H.hsize(H.cache_size(cfg['folder']))}"); cl.grid(row=9, column=0, sticky="w", padx=px(22), pady=px(8))
-        RBtn(w, "Clear cache", lambda: (clear_cache_ui(), cl.configure(text=f"Transfer cache: {H.hsize(H.cache_size(cfg['folder']))}")), h=30, icon="trash").grid(row=9, column=1, sticky="w")
+        for j, (k, l) in enumerate((("visible", "Visible to nearby devices"), ("auto", "Auto-accept everything"), ("open_after", "Open folder after receiving"), ("recovery", "Repair files that arrive damaged, using recovery data from the sender"), ("verify_disk", "Re-check each saved file against the sender's checksum"), ("summary", "Show a summary window when a transfer finishes"))):
+            tk.Checkbutton(w, text=l, variable=b[k], bg=P["bg"], fg=P["text"], selectcolor=P["card"], activebackground=P["bg"], activeforeground=P["text"], font=F(10)).grid(row=6 + j, column=1, sticky="w", pady=px(2))
+        RBtn(w, f"Clear trusted devices ({len(cfg['trusted'])})", lambda: (cfg["trusted"].clear(), H.save_cfg(cfg)), h=30).grid(row=12, column=1, sticky="w", pady=px(8))
+        cl = label(w, f"Transfer cache: {H.hsize(H.cache_size(cfg['folder']))}"); cl.grid(row=13, column=0, sticky="w", padx=px(22), pady=px(8))
+        RBtn(w, "Clear cache", lambda: (clear_cache_ui(), cl.configure(text=f"Transfer cache: {H.hsize(H.cache_size(cfg['folder']))}")), h=30, icon="trash").grid(row=13, column=1, sticky="w")
         def ok():
-            try: port, rs = int(v["port"].get()), int(v["reconnect_s"].get())
-            except ValueError: return toast("Port and reconnect time must be numbers")
-            cfg.update(name=v["name"].get(), folder=v["folder"].get(), port=port, pin=v["pin"].get(), reconnect_s=max(10, rs), **{k: b[k].get() for k in b})
+            try: port, rs, gb = int(v["port"].get()), int(v["reconnect_s"].get()), float(v["rec_max_gb"].get().replace(",", "."))
+            except ValueError: return toast("Port, reconnect time and repair size must be numbers")
+            cfg.update(name=v["name"].get(), folder=v["folder"].get(), port=port, pin=v["pin"].get(), reconnect_s=max(10, rs), rec_max_gb=min(max(gb, 0.01), 1000.0), **{k: b[k].get() for k in b})
             os.makedirs(cfg["folder"], exist_ok=True); H.save_cfg(cfg); W["path"].configure(text=short(cfg["folder"], 30)); w.destroy(); toast("Saved (restart to apply a new port)")
-        if WIN.IS_WIN: RBtn(w, "Fix Windows Firewall (phones can't find this PC)", do_fw_fix, h=30, icon="check").grid(row=10, column=1, sticky="w", pady=px(8))
-        RBtn(w, "Save", ok, primary=True, icon="check").grid(row=11, column=1, pady=px(16), sticky="w")
+        if WIN.IS_WIN: RBtn(w, "Fix Windows Firewall (phones can't find this PC)", do_fw_fix, h=30, icon="check").grid(row=14, column=1, sticky="w", pady=px(8))
+        RBtn(w, "Save", ok, primary=True, icon="check").grid(row=15, column=1, pady=px(16), sticky="w")
 
     def set_theme(name):
         if name == cfg["theme"]: return
@@ -733,7 +835,7 @@ def main():
             paint_done(card, c, state, msg)
         for c in list(active):
             card = make_card(c)
-            if c.names: card.set_files(c.names, c.sizes); card.update_files(c.fdone)
+            if c.names: card.set_files(c.names, c.sizes); card.update_files(c.fdone, fstate=c.fstate)
             if c.last[1]: on_prog(c, *c.last)
         WIN.style_titlebar(root, P["bg"], P["text"], P["accent"], P["dark"]); check_fw()
 
