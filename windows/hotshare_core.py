@@ -14,7 +14,7 @@ import hashlib, hmac, itertools, json, os, platform, queue, re, shutil, socket, 
 HOME = os.path.expanduser("~")
 CFG_PATH = os.path.join(HOME, ".hotshare", "config.json")
 DEF = {"name": socket.gethostname(), "folder": os.path.join(HOME, "Downloads", "HotShare"), "port": 45455, "pin": "", "auto": False, "theme": "Midnight",
-       "visible": True, "open_after": False, "recovery": True, "rec_max_gb": 1.0, "verify_disk": True, "summary": True, "retries": 3, "reconnect_s": 900, "trusted": [], "history": []}
+       "visible": True, "open_after": False, "recovery": True, "skip_failed": True, "rec_max_gb": 1.0, "verify_disk": True, "summary": True, "retries": 3, "reconnect_s": 900, "trusted": [], "history": []}
 DISC, BUF, MAXH = 45454, 1 << 20, 16 << 20
 _lock = threading.Lock()
 APPROVED, PAUSED, CANCELLED = {}, set(), {}
@@ -110,7 +110,7 @@ def _rm(p):
         except OSError: pass
 
 
-BUILD = "r11d-ondemand"     # shown in the window title and in error messages so you can tell which build is running
+BUILD = "r12-noskip"     # shown in the window title and in error messages so you can tell which build is running
 
 def where(e):
     """'file.py:line' of the innermost frame of an exception, for error messages."""
@@ -542,6 +542,7 @@ def _handle(sock, ctl, r, first=None):
     except BaseException as e:
         w.finish()
         for pf_ in pending: _cut_part(pf_[4], min(x[0] for x in pf_[5]) // CHK * CHK)      # files held for repair: on the next connection continue from their first damaged block instead of trusting what is on disk
+        can_skip = cfg.get("skip_failed", True)      # off: never give up on a file by itself - keep fetching it again until it arrives right (or the sender's reconnect time runs out)
         if isinstance(e, InterruptedError): APPROVED.pop(key, None); CANCELLED[key] = time.time()
         if isinstance(e, Rerun):      # the user cancelled file(s): remember them, drop their partial data, and let the sender reconnect without them
             for ix in ctl.skip_req: SKIP.setdefault(key, set()).add(ctl.fids[ix])
@@ -552,12 +553,12 @@ def _handle(sock, ctl, r, first=None):
             _cut_part(parts.get(e.fid, ""), e.start)
             c_ = BAD[(key, e.fid, e.start)] = BAD.get((key, e.fid, e.start), 0) + 1
             tot = sum(v for k_, v in BAD.items() if len(k_) == 3 and k_[:2] == (key, e.fid))
-            if c_ >= 5 or tot >= 40: SKIP.setdefault(key, set()).add(e.fid); FAILED.setdefault(key, {})[e.fid] = "data kept arriving damaged"; _rm(parts.get(e.fid, "")); e = BlockBad(f"data keeps arriving damaged in {e} at {hsize(e.start)} - file skipped, the rest continues", e.fid, e.start)
+            if can_skip and (c_ >= 5 or tot >= 40): SKIP.setdefault(key, set()).add(e.fid); FAILED.setdefault(key, {})[e.fid] = "data kept arriving damaged"; _rm(parts.get(e.fid, "")); e = BlockBad(f"data keeps arriving damaged in {e} at {hsize(e.start)} - file skipped, the rest continues", e.fid, e.start)
             else: e = BlockBad(f"data damaged in transit in {e} at {hsize(e.start)} - repairing: fetching again from that point (repair {tot})", e.fid, e.start)
         elif isinstance(e, Mismatch):                       # the file is re-sent from zero once; if it fails again it is skipped instead of looping forever
             BAD[(key, e.fid)] = BAD.get((key, e.fid), 0) + 1; tries = BAD[(key, e.fid)]
-            if tries >= 3: SKIP.setdefault(key, set()).add(e.fid); FAILED.setdefault(key, {})[e.fid] = "checksum kept failing (3 attempts)"; e = Mismatch(f"{e} (3 times) - file skipped, the rest continues. It may be changing while it is read, or unreadable on the sender", e.fid)
-            else: e = Mismatch(f"{e} - repairing: downloading it again from scratch (attempt {tries + 1}/3)", e.fid)
+            if can_skip and tries >= 3: SKIP.setdefault(key, set()).add(e.fid); FAILED.setdefault(key, {})[e.fid] = "checksum kept failing (3 attempts)"; e = Mismatch(f"{e} (3 times) - file skipped, the rest continues. It may be changing while it is read, or unreadable on the sender", e.fid)
+            else: e = Mismatch(f"{e} - repairing: downloading it again from scratch (attempt {tries + 1}{'/3' if can_skip else ''})", e.fid)
         elif isinstance(e, UnicodeError):
             e = Desync(f"unreadable text from the sender at {where(e)} ({type(e).__name__}) [build {BUILD}]", None)
         elif isinstance(e, Desync):
@@ -565,7 +566,8 @@ def _handle(sock, ctl, r, first=None):
                 LEGACY.add(peer); e = Desync(f"{e} - retrying in compatibility mode", e.fid)
             else:                                                                           # same file went wrong twice: give up on that one file, keep the rest
                 BAD[(key, e.fid)] = BAD.get((key, e.fid), 0) + 1
-                if BAD[(key, e.fid)] >= 2: SKIP.setdefault(key, set()).add(e.fid); FAILED.setdefault(key, {})[e.fid] = "sender and receiver lost step"; _rm(parts.get(e.fid, "")); e = Desync(f"{e} - that file was skipped, the rest continues", e.fid)
+                if can_skip and BAD[(key, e.fid)] >= 2: SKIP.setdefault(key, set()).add(e.fid); FAILED.setdefault(key, {})[e.fid] = "sender and receiver lost step"; _rm(parts.get(e.fid, "")); e = Desync(f"{e} - that file was skipped, the rest continues", e.fid)
+                elif BAD[(key, e.fid)] >= 2: _rm(parts.get(e.fid, "")); e = Desync(f"{e} - fetching that file again from the start", e.fid)
         try: sock.sendall(b"ERR paused\n" if isinstance(e, Paused) else f"ERR {e}\n".encode())
         except OSError: pass
         if ctl.discard:

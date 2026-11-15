@@ -719,23 +719,23 @@ def main():
 
     def settings():
         w = dialog("Settings")
-        v = {k: tk.StringVar(value=str(cfg[k])) for k in ("name", "folder", "port", "pin", "reconnect_s", "rec_max_gb")}; b = {k: tk.BooleanVar(value=cfg[k]) for k in ("auto", "visible", "open_after", "recovery", "verify_disk", "summary")}
+        v = {k: tk.StringVar(value=str(cfg[k])) for k in ("name", "folder", "port", "pin", "reconnect_s", "rec_max_gb")}; b = {k: tk.BooleanVar(value=cfg[k]) for k in ("auto", "visible", "open_after", "recovery", "verify_disk", "summary", "skip_failed")}
         for i, (k, l) in enumerate((("name", "Device name"), ("folder", "Save folder"), ("port", "Port"), ("pin", "Shared PIN"), ("reconnect_s", "Keep reconnecting for (seconds)"), ("rec_max_gb", "Repair files up to (GB)"))):
             label(w, l).grid(row=i, column=0, sticky="w", padx=px(22), pady=px(7))
             tk.Entry(w, textvariable=v[k], width=34, bg=P["card2"], fg=P["text"], insertbackground=P["text"], relief="flat", font=F(10)).grid(row=i, column=1, padx=px(6), ipady=px(5))
         RBtn(w, "Browse", lambda: v["folder"].set(filedialog.askdirectory(parent=w) or v["folder"].get()), h=30, icon="folder").grid(row=1, column=2, padx=px(10))
-        for j, (k, l) in enumerate((("visible", "Visible to nearby devices"), ("auto", "Auto-accept everything"), ("open_after", "Open folder after receiving"), ("recovery", "Repair files that arrive damaged, using recovery data from the sender"), ("verify_disk", "Re-check each saved file against the sender's checksum"), ("summary", "Show a summary window when a transfer finishes"))):
+        for j, (k, l) in enumerate((("visible", "Visible to nearby devices"), ("auto", "Auto-accept everything"), ("open_after", "Open folder after receiving"), ("recovery", "Repair files that arrive damaged, using recovery data from the sender"), ("verify_disk", "Re-check each saved file against the sender's checksum"), ("summary", "Show a summary window when a transfer finishes"), ("skip_failed", "Skip a file that keeps failing (turn off to keep retrying it until it arrives right)"))):
             tk.Checkbutton(w, text=l, variable=b[k], bg=P["bg"], fg=P["text"], selectcolor=P["card"], activebackground=P["bg"], activeforeground=P["text"], font=F(10)).grid(row=6 + j, column=1, sticky="w", pady=px(2))
-        RBtn(w, f"Clear trusted devices ({len(cfg['trusted'])})", lambda: (cfg["trusted"].clear(), H.save_cfg(cfg)), h=30).grid(row=12, column=1, sticky="w", pady=px(8))
-        cl = label(w, f"Transfer cache: {H.hsize(H.cache_size(cfg['folder']))}"); cl.grid(row=13, column=0, sticky="w", padx=px(22), pady=px(8))
-        RBtn(w, "Clear cache", lambda: (clear_cache_ui(), cl.configure(text=f"Transfer cache: {H.hsize(H.cache_size(cfg['folder']))}")), h=30, icon="trash").grid(row=13, column=1, sticky="w")
+        RBtn(w, f"Clear trusted devices ({len(cfg['trusted'])})", lambda: (cfg["trusted"].clear(), H.save_cfg(cfg)), h=30).grid(row=13, column=1, sticky="w", pady=px(8))
+        cl = label(w, f"Transfer cache: {H.hsize(H.cache_size(cfg['folder']))}"); cl.grid(row=14, column=0, sticky="w", padx=px(22), pady=px(8))
+        RBtn(w, "Clear cache", lambda: (clear_cache_ui(), cl.configure(text=f"Transfer cache: {H.hsize(H.cache_size(cfg['folder']))}")), h=30, icon="trash").grid(row=14, column=1, sticky="w")
         def ok():
             try: port, rs, gb = int(v["port"].get()), int(v["reconnect_s"].get()), float(v["rec_max_gb"].get().replace(",", "."))
             except ValueError: return toast("Port, reconnect time and repair size must be numbers")
             cfg.update(name=v["name"].get(), folder=v["folder"].get(), port=port, pin=v["pin"].get(), reconnect_s=max(10, rs), rec_max_gb=min(max(gb, 0.01), 1000.0), **{k: b[k].get() for k in b})
             os.makedirs(cfg["folder"], exist_ok=True); H.save_cfg(cfg); W["path"].configure(text=short(cfg["folder"], 30)); w.destroy(); toast("Saved (restart to apply a new port)")
-        if WIN.IS_WIN: RBtn(w, "Fix Windows Firewall (phones can't find this PC)", do_fw_fix, h=30, icon="check").grid(row=14, column=1, sticky="w", pady=px(8))
-        RBtn(w, "Save", ok, primary=True, icon="check").grid(row=15, column=1, pady=px(16), sticky="w")
+        if WIN.IS_WIN: RBtn(w, "Fix Windows Firewall (phones can't find this PC)", do_fw_fix, h=30, icon="check").grid(row=15, column=1, sticky="w", pady=px(8))
+        RBtn(w, "Save", ok, primary=True, icon="check").grid(row=16, column=1, pady=px(16), sticky="w")
 
     def set_theme(name):
         if name == cfg["theme"]: return
