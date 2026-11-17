@@ -14,7 +14,7 @@ import hashlib, hmac, itertools, json, os, platform, queue, re, shutil, socket, 
 HOME = os.path.expanduser("~")
 CFG_PATH = os.path.join(HOME, ".hotshare", "config.json")
 DEF = {"name": socket.gethostname(), "folder": os.path.join(HOME, "Downloads", "HotShare"), "port": 45455, "pin": "", "auto": False, "theme": "Midnight",
-       "visible": True, "open_after": False, "recovery": True, "skip_failed": True, "rec_max_gb": 1.0, "verify_disk": True, "summary": True, "retries": 3, "reconnect_s": 900, "trusted": [], "history": []}
+       "visible": True, "open_after": False, "recovery": True, "skip_failed": True, "rec_max_gb": 32.0, "cfg_ver": 0, "verify_disk": True, "summary": True, "retries": 3, "reconnect_s": 900, "trusted": [], "history": []}
 DISC, BUF, MAXH = 45454, 1 << 20, 16 << 20
 _lock = threading.Lock()
 APPROVED, PAUSED, CANCELLED = {}, set(), {}
@@ -51,6 +51,9 @@ def load_cfg():
     c = dict(DEF)
     try: c.update(json.load(open(CFG_PATH, encoding="utf-8")))
     except Exception: pass
+    if c.get("cfg_ver", 0) < 13:      # r13: recovery data is only sent for files that arrive damaged, so the old 1 GB default limit only made big videos retry slowly
+        if c.get("rec_max_gb") == 1.0: c["rec_max_gb"] = DEF["rec_max_gb"]
+        c["cfg_ver"] = 13
     return c
 
 
@@ -104,13 +107,17 @@ def move_retry(src, dst, tries=12):
             time.sleep(.2 * (i + 1))
 
 
+CKSTATE, _SIG = {}, {}   # part path -> {position: sha256 state} at every checkpoint / part path -> (size, mtime_ns, state): a partial we cut ourselves moments ago needs no re-reading when the sender reconnects
+
+
 def _rm(p):
+    if p.endswith(".part"): CKSTATE.pop(p, None); _SIG.pop(p, None)
     for q in ((p, p + ".chk") if p.endswith(".part") else (p,)):
         try: os.remove(lp(q))
         except OSError: pass
 
 
-BUILD = "r12-noskip"     # shown in the window title and in error messages so you can tell which build is running
+BUILD = "r16-blocks"     # shown in the window title and in error messages so you can tell which build is running
 
 def where(e):
     """'file.py:line' of the innermost frame of an exception, for error messages."""
@@ -120,24 +127,26 @@ def where(e):
 
 
 CHK = 4 << 20    # block size: a checkpoint (position + checksum of everything before it) is saved at every multiple of 4 MiB, and (when the sender supports it) every block is verified on arrival
-CAPS = ["blk", "rep"]   # blk: per-block checksums; rep: can send recovery data when the receiver asks for it
-REC_GROUP = 32   # recovery data (like a RAR "recovery record"), sent ONLY for files that arrived with damaged blocks: one parity block per 32 blocks (about 3% of that file) lets the receiver rebuild ONE damaged 4 MiB block per group
+CAPS = ["blk", "rep", "repg", "repb"]   # blk: per-block checksums; rep: can send recovery data when the receiver asks for it; repg: can send it for just the groups that are asked for; repb: can simply send again just the damaged blocks that are asked for (no recovery data, no group limits)
+REC_GROUP = 8   # recovery data (like a RAR "recovery record"), sent ONLY for files that arrived with damaged blocks: one parity block per 8 blocks (12.5% of that file, only when it is needed) lets the receiver rebuild ONE damaged 4 MiB block per group of 32 MiB (the group size is announced by the receiver, senders follow it)
 
 
-def parity_blocks(path, size):
+def parity_blocks(path, size, group=REC_GROUP, only=None):
     """Yields the recovery (XOR parity) block of each group of REC_GROUP blocks of a file, reading the file front to back. One block in memory at a time."""
     with open(lp(path), "rb") as f:
-        for g in range(rec_groups(size)):
-            acc = bytearray(CHK); g0 = g * REC_GROUP * CHK; end = min(size, g0 + REC_GROUP * CHK); pos = g0
+        n_g = rec_groups(size, group)
+        for g in (range(n_g) if only is None else sorted({int(x) for x in only if 0 <= int(x) < n_g})):
+            acc = bytearray(CHK); g0 = g * group * CHK; end = min(size, g0 + group * CHK); pos = g0
+            if only is not None: f.seek(g0)      # targeted: read only the groups that contain damage
             while pos < end:
                 o = pos % CHK; n = min(BUF, end - pos, CHK - o); b = f.read(n)
                 if len(b) != n: raise IOError("file changed while building recovery data")
                 acc[o:o + n] = (int.from_bytes(acc[o:o + n], "big") ^ int.from_bytes(b, "big")).to_bytes(n, "big"); pos += n
-            yield bytes(acc[:rec_plen(size, g)])
+            yield bytes(acc[:rec_plen(size, g, group)])
 
 
-def rec_groups(size): return -(-(-(-size // CHK)) // REC_GROUP)
-def rec_plen(size, g): return min(CHK, size - g * REC_GROUP * CHK)
+def rec_groups(size, group=REC_GROUP): return -(-(-(-size // CHK)) // group)
+def rec_plen(size, g, group=REC_GROUP): return min(CHK, size - g * group * CHK)
 
 
 def _chk_add(part, pos, md):
@@ -162,6 +171,13 @@ def _cut_part(p, start):
         keep = [l for l in open(lp(p + ".chk"), encoding="ascii") if l.split() and l.split()[0].isdigit() and int(l.split()[0]) <= start]
         with open(lp(p + ".chk"), "w", encoding="ascii") as c: c.writelines(keep)
     except OSError: pass
+    st = CKSTATE.get(p)
+    if st:
+        for k in [k for k in st if k > start]: del st[k]
+    try:
+        if st and start in st: x = os.stat(lp(p)); _SIG[p] = (x.st_size, x.st_mtime_ns, st[start].copy(), start)
+        else: _SIG.pop(p, None)
+    except OSError: _SIG.pop(p, None)
 
 
 def verify_part(p):
@@ -169,6 +185,11 @@ def verify_part(p):
     A partial written by this version has checkpoints: it is checked against them and cut back to the last one that still matches, so damage
     (power cut, antivirus, a stale writer, disk error) costs a few MB of re-download instead of a corrupt file. One without checkpoints is trusted as is."""
     n = os.path.getsize(lp(p)) if os.path.exists(lp(p)) else 0
+    sg = _SIG.get(p)
+    if n and sg and n == sg[3] == sg[0]:      # cut back by this very process a moment ago and untouched since: no need to read it all again (the final checks on the finished file still run)
+        try:
+            if os.stat(lp(p)).st_mtime_ns == sg[1]: return n, sg[2].copy(), False
+        except OSError: pass
     try: cps = sorted({(int(a[0]), a[1]) for a in (l.split() for l in open(lp(p + ".chk"), encoding="ascii")) if len(a) == 2 and a[0].isdigit()})
     except OSError: cps = None
     if not n or cps is None: return n, None, False
@@ -277,6 +298,7 @@ class Ctl:
         s.names, s.sizes, s.fdone, s.last, s.on_files = [], [], [], (0, 0, 0, 0), (lambda: None); s.on_state = lambda st, msg: None
         s.changed_ix, s.repaired_ix, s.report_repaired = set(), set(), {}
         s.report_failed, s.report_saved, s.failed_ix = {}, {}, set()   # completion summary: file id -> reason / file id -> saved path / indices the receiver gave up on (sender side)
+        s.pfx = {}      # sender: checksum states at block boundaries, so a reconnect does not read the already-sent part again
         s.fids, s.fstate, s.skip_req, s.gone, s.fsent = [], {}, set(), set(), set()   # per-file: ids / "skipped" rows / cancel requests / rows removed from the manifest / rows already fully sent
 
     def set_state(s, st, msg=""): s.state = st; s.on_state(st, msg)
@@ -327,6 +349,7 @@ class _Writer(threading.Thread):
                             while b := pf.read(BUF): s.md.update(b)
                         _chk_add(part, off, s.md)
                     s.f = open(lp(part), "ab", buffering=0)
+                    if off: CKSTATE.setdefault(part, {})[off] = s.md.copy()
                 elif k == "data":
                     mv = memoryview(m[1])
                     while mv:                                            # a raw write may store fewer bytes than asked: never drop the rest silently (the hash below covers what we RECEIVED, not what reached the disk)
@@ -334,15 +357,17 @@ class _Writer(threading.Thread):
                         if not n_: raise IOError("disk write stalled - file not fully written")
                         mv = mv[n_:]
                     s.md.update(m[1]); s.pos += len(m[1])
-                    if s.pos % CHK == 0: _chk_add(s.part, s.pos, s.md)
+                    if s.pos % CHK == 0: _chk_add(s.part, s.pos, s.md); CKSTATE.setdefault(s.part, {})[s.pos] = s.md.copy()
                 elif k == "sync": m[1].set()
                 elif k == "hold": s.f.close(); s.f = None      # file has damaged blocks: keep what is on disk, recovery data may rebuild them after the other files are done
                 elif k == "repair":      # damaged blocks rebuilt from the recovery data (everything before this message is on disk already)
-                    _, part, size, todo, fid_r, rel_r = m
+                    _, part, size, todo, fid_r, rel_r, grp_ = m
                     with open(lp(part), "r+b") as pf:
                         for sg, ps, cl, par in todo:
-                            bi = sg // CHK; g = bi // REC_GROUP; acc = int.from_bytes(par, "big"); L = min(CHK, size - bi * CHK)
-                            for oj in range(g * REC_GROUP, min((g + 1) * REC_GROUP, -(-size // CHK))):
+                            if not grp_:      # the sender sent this block again: just put it in place
+                                pf.seek(sg); pf.write(par); pf.flush(); s.ctl.log(f"Re-fetched a damaged block at {hsize(sg)} of {rel_r}"); continue
+                            bi = sg // CHK; g = bi // grp_; acc = int.from_bytes(par, "big"); L = min(CHK, size - bi * CHK)
+                            for oj in range(g * grp_, min((g + 1) * grp_, -(-size // CHK))):
                                 if oj == bi: continue
                                 pf.seek(oj * CHK); blk = pf.read(min(CHK, size - oj * CHK)); acc ^= int.from_bytes(blk + bytes(len(par) - len(blk)), "big")
                             fixed = acc.to_bytes(len(par), "big")[:L]
@@ -352,7 +377,7 @@ class _Writer(threading.Thread):
                 elif k == "fin":
                     _, expected, part, rel, size, idx, fid_ = m[:7]; fixed_ = len(m) > 7 and m[7]
                     if s.f: s.f.close()
-                    s.f = None
+                    s.f = None; CKSTATE.pop(part, None); _SIG.pop(part, None)
                     if not fixed_ and expected != s.md.hexdigest(): _rm(part); raise Mismatch(f"checksum mismatch: {rel}", fid_)
                     if os.path.getsize(lp(part)) != size: _rm(part); raise Mismatch(f"checksum mismatch: {rel} (saved size differs from the announced size)", fid_)
                     if fixed_ or s.ctl.cfg.get("verify_disk", True):                # read the saved file back and hash it: proves the bytes on disk equal the sender's, not just the bytes that came off the network
@@ -453,10 +478,12 @@ def _handle(sock, ctl, r, first=None):
     total_left = sum(f["size"] for f in files if f.get("t") == "file" and f["id"] not in fin)
     if shutil.disk_usage(root).free < total_left - sum(offs.values()):
         sock.sendall(b"ERR not enough free space\n"); raise IOError("not enough free space")
-    rec_mode = False
+    rec_mode = False; grp = REC_GROUP; sel = False; blkfix = False
     blk_mode = "blk" in (h.get("caps") or [])      # the sender can append a checksum after every block: we verify each block the moment it arrives
     rec_mode = blk_mode and not legacy and "rep" in (h.get("caps") or []) and cfg.get("recovery", True)      # the sender can answer a REPAIR request with recovery data (the older "rec" meant something else and is ignored)
-    sock.sendall(b"OK\n" + json.dumps({"off": offs, "done": [] if legacy else sorted(fin), "failed": sorted(FAILED.get(key, {})), **({"blk": CHK} if blk_mode else {}), **({"rep": REC_GROUP} if rec_mode else {})}).encode() + b"\n")
+    blkfix = blk_mode and not legacy and "repb" in (h.get("caps") or []) and cfg.get("recovery", True)      # best case: the sender just sends the damaged blocks again
+    sel = rec_mode and "repg" in (h.get("caps") or []); grp = 4 if sel else REC_GROUP      # a sender that sends just the groups asked for needs smaller groups at no extra cost: fewer double faults, less to read
+    sock.sendall(b"OK\n" + json.dumps({"off": offs, "done": [] if legacy else sorted(fin), "failed": sorted(FAILED.get(key, {})), **({"blk": CHK} if blk_mode else {}), **({"rep": grp} if rec_mode or blkfix else {})}).encode() + b"\n")
     total -= sum(f["size"] for f in files if f.get("t") == "file" and f["id"] in skipped)
     done = sum(n for i, n in offs.items() if i in parts) + sum(f["size"] for f in files if f.get("t") == "file" and f["id"] in fin_ok); ctl.start(done)
     ctl.set_files([f["path"] if f["t"] == "file" else "Text message" for f in files], [f.get("size", 0) for f in files]); ctl.fids = [f["id"] for f in files]
@@ -471,7 +498,7 @@ def _handle(sock, ctl, r, first=None):
         if len(b) == 65 and b[64:] == b"\n" and _HEX.fullmatch(b[:64]): return b[:64].decode()
         if not b: raise ConnectionError("connection lost")
         raise Desync(f"out of sync at '{f['path']}': the sender's data does not match the size it announced", f["id"])
-    w = _Writer(ctl, dest, key); w.start(); pending = []; rec_hi = int(max(0.01, float(cfg.get("rec_max_gb", 1.0) or 1.0)) * (1 << 30))
+    w = _Writer(ctl, dest, key); w.start(); pending = []; cur = None; rec_hi = int(max(0.01, float(cfg.get("rec_max_gb", 1.0) or 1.0)) * (1 << 30))
     try:
         for idx, f in enumerate(files):
             if f["id"] in fin:
@@ -485,7 +512,7 @@ def _handle(sock, ctl, r, first=None):
             if idx in ctl.skip_req: raise Rerun(f"skipped {rel}")
             if off: ctl.log(f"Resuming {rel} from {hsize(off)}")
             if blk_mode and off > 0 and hashline(f) != mds[f["id"]].hexdigest(): raise Stale(f"'{rel}'", f["id"])     # the sender hashed the part it skips: our partial copy must match it
-            w.put(("start", part, off, mds.get(f["id"]))); left = size - off; pos = off; bmd = hashlib.sha256(); use_rec = rec_mode and CHK < size <= rec_hi; bad = []; seg = off
+            w.put(("start", part, off, mds.get(f["id"]))); left = size - off; pos = off; bmd = hashlib.sha256(); use_rec = blkfix or (rec_mode and CHK < size <= rec_hi); bad = []; seg = off; cur = (part, bad)
             while left:
                 if idx in ctl.skip_req: raise Rerun(f"skipped {rel}")
                 b = r.read(min(BUF, left, CHK - pos % CHK))      # never read across a block boundary
@@ -498,7 +525,7 @@ def _handle(sock, ctl, r, first=None):
                         if claimed != bmd.hexdigest():
                             if not use_rec: raise BlockBad(f"'{rel}'", f["id"], (pos - 1) // CHK * CHK)
                             bad.append((seg, pos, claimed))      # keep receiving: the recovery data that follows may rebuild this block
-                            if sum(1 for b_ in bad if b_[0] // CHK // REC_GROUP == seg // CHK // REC_GROUP) > 1:      # a second damaged block in the same group: recovery data cannot fix that, so stop wasting the transfer
+                            if not blkfix and sum(1 for b_ in bad if b_[0] // CHK // grp == seg // CHK // grp) > 1:      # a second damaged block in the same group: recovery data cannot fix that, so stop wasting the transfer
                                 raise BlockBad(f"'{rel}'", f["id"], min(b_[0] for b_ in bad) // CHK * CHK)
                         bmd = hashlib.sha256(); seg = pos
             expected = hashline(f)
@@ -513,21 +540,41 @@ def _handle(sock, ctl, r, first=None):
             extra = pending[1500:]; pending = pending[:1500]      # the request is one line: keep it small, the rest is simply fetched again from its first bad block
             sock.settimeout(1800)      # the sender re-reads each of these files to build its recovery data: that can take a while
             ctl.log(f"{len(pending)} file(s) arrived with damaged blocks - asking the sender for recovery data for those only")
-            sock.sendall(b"REPAIR " + json.dumps({"files": [p_[0]["id"] for p_ in pending]}).encode() + b"\n")
-            unfixable = None
+            byf = []
             for f, rel, size, idx, part, bad, expected in pending:
-                pars = []
-                for g in range(rec_groups(size)):
-                    n_ = rec_plen(size, g); p_ = r.read(n_)
-                    if len(p_) < n_: raise ConnectionError("connection lost")
-                    pars.append(p_ if hashline(f) == hashlib.sha256(p_).hexdigest() else None)       # damaged recovery data is simply not used
                 by = {}
-                for sg, ps, cl in bad: by.setdefault(sg // CHK // REC_GROUP, []).append((sg, ps, cl))
-                if any(len(v) > 1 or pars[g] is None for g, v in by.items()):      # more damage than the recovery data can fix: that file is fetched again from its first bad block
-                    st_ = min(x[0] for v in by.values() for x in v) // CHK * CHK; _cut_part(part, st_)
+                for sg, ps, cl in bad: by.setdefault(sg // CHK if blkfix else sg // CHK // grp, []).append((sg, ps, cl))
+                byf.append((f, rel, size, idx, part, bad, expected, by, {}))
+            need = [(e, sorted(e[7])) for e in byf] if sel or blkfix else [(e, list(range(rec_groups(e[2], grp)))) for e in byf]      # targeted: only the groups that contain damage
+            stall, left_ = 0, None
+            for rnd in range(30 if blkfix else 3 if sel else 1):      # a block that arrives damaged again is asked for again (as long as that makes progress), not a reason to fetch the whole file again
+                if not need: break
+                n_miss = sum(len(gs) for _, gs in need)
+                if blkfix and left_ is not None:
+                    stall = stall + 1 if n_miss >= left_ else 0
+                    if stall >= 3: break      # nothing is getting through any more: give up on this way and fall back to fetching from the first bad block
+                left_ = n_miss
+                sock.sendall(b"REPAIR " + json.dumps({"files": [e[0]["id"] for e, _ in need], **({("blocks" if blkfix else "groups"): {e[0]["id"]: gs for e, gs in need}} if sel or blkfix else {})}).encode() + b"\n")
+                nxt = []
+                for e, gs in need:
+                    miss = []
+                    for g in gs:
+                        n_ = min(CHK, e[2] - g * CHK) if blkfix else rec_plen(e[2], g, grp); p_ = r.read(n_)
+                        if len(p_) < n_: raise ConnectionError("connection lost")
+                        if hashline(e[0]) == hashlib.sha256(p_).hexdigest():
+                            if blkfix: w.put(("repair", e[4], e[2], [(g * CHK, g * CHK + len(p_), "", p_)], e[0]["id"], e[1], 0)); e[8][g] = True      # straight to disk: nothing piles up in memory
+                            else: e[8][g] = p_
+                        else: miss.append(g)
+                    if miss and (sel or blkfix): nxt.append((e, miss))
+                need = nxt
+            unfixable = None
+            for f, rel, size, idx, part, bad, expected, by, pars in byf:
+                if any((len(v) > 1 and not blkfix) or pars.get(g) is None for g, v in by.items()):      # more damage than the recovery data can fix: that file is fetched again from its first bad block
+                    st_ = 0 if blkfix and any(pars.values()) else min(x[0] for v in by.values() for x in v) // CHK * CHK; _cut_part(part, st_)      # (blocks already put back make the saved checkpoints stale: start that file over)
                     if unfixable is None: unfixable = BlockBad(f"'{rel}'", f["id"], st_)
                     continue
-                w.put(("repair", part, size, [(sg, ps, cl, pars[g]) for g, v in by.items() for sg, ps, cl in v], f["id"], rel)); w.put(("fin", expected, part, rel, size, idx, f["id"], True))
+                if not blkfix: w.put(("repair", part, size, [(sg, ps, cl, pars[g]) for g, v in by.items() for sg, ps, cl in v], f["id"], rel, grp))
+                w.put(("fin", expected, part, rel, size, idx, f["id"], True))
             for f, rel, size, idx, part, bad, expected in extra:
                 st_ = min(x[0] for x in bad) // CHK * CHK; _cut_part(part, st_)
                 if unfixable is None: unfixable = BlockBad(f"'{rel}'", f["id"], st_)
@@ -541,6 +588,7 @@ def _handle(sock, ctl, r, first=None):
         except OSError: pass
     except BaseException as e:
         w.finish()
+        if cur and cur[1]: _cut_part(cur[0], min(x[0] for x in cur[1]) // CHK * CHK)      # connection dropped in the middle of a file that already had damaged blocks: resume from the first of them, not after them (the sender would take the damaged part for a changed file and restart it)
         for pf_ in pending: _cut_part(pf_[4], min(x[0] for x in pf_[5]) // CHK * CHK)      # files held for repair: on the next connection continue from their first damaged block instead of trusting what is on disk
         can_skip = cfg.get("skip_failed", True)      # off: never give up on a file by itself - keep fetching it again until it arrives right (or the sender's reconnect time runs out)
         if isinstance(e, InterruptedError): APPROVED.pop(key, None); CANCELLED[key] = time.time()
@@ -601,7 +649,7 @@ def collect(paths):
 def text_item(txt): return {"t": "text", "text": txt, "rel": "text", "size": len(txt.encode())}
 
 
-def _producer(items, offs, dones, q, stop, blk=0, rec=0):
+def _producer(items, offs, dones, q, stop, blk=0, rec=0, cache=None):
     def put(m):
         while not stop.is_set():
             try: q.put(m, timeout=.5); return
@@ -611,12 +659,19 @@ def _producer(items, offs, dones, q, stop, blk=0, rec=0):
             if stop.is_set(): return
             if it["t"] == "text" or it["id"] in dones: put(("skip", ix)); continue
             off, md = min(max(int(offs.get(it["id"], 0)), 0), it["size"]), hashlib.sha256()
+            try: x = os.stat(lp(it["abs"])); sig = (x.st_size, x.st_mtime_ns)
+            except OSError: sig = None
+            ent = cache.get(it["id"]) if cache is not None and blk else None
+            if ent and (ent["sig"] != sig or sig is None or time.monotonic() - ent["t"] > 300): ent = None      # only trust it for a few minutes and an unchanged file
+            if ent is None and cache is not None and blk: ent = cache[it["id"]] = {"sig": sig, "t": time.monotonic(), "st": {}}
             with open(lp(it["abs"]), "rb", buffering=0) as f:
                 left = off
+                if off and ent and off in ent["st"]: md = ent["st"][off].copy(); f.seek(off); left = 0      # a repair retry: the part before the damaged block was hashed a moment ago
                 while left:
                     b = f.read(min(BUF, left))
                     if not b: raise IOError("file changed while sending: " + it["rel"])
                     md.update(b); left -= len(b)
+                if ent and off and blk and off % blk == 0: ent["st"][off] = md.copy()
                 if blk and off > 0: put(("phash", ix, md.hexdigest()))      # checksum of the part the receiver already holds: lets it notice a changed file before downloading the rest
                 put(("start", ix, off)); left = it["size"] - off; pos = off; bmd = hashlib.sha256()
                 while left:
@@ -626,11 +681,14 @@ def _producer(items, offs, dones, q, stop, blk=0, rec=0):
                     md.update(b); left -= len(b); pos += len(b); put(("data", ix, b))
                     if blk:
                         bmd.update(b)
-                        if pos % blk == 0 or not left: put(("bhash", ix, bmd.hexdigest())); bmd = hashlib.sha256()
+                        if pos % blk == 0 or not left:
+                            put(("bhash", ix, bmd.hexdigest())); bmd = hashlib.sha256()
+                            if ent and left: ent["st"][pos] = md.copy(); ent["t"] = time.monotonic()
             try: st2 = os.stat(lp(it["abs"]))
             except OSError: st2 = None
             if st2 is None or st2.st_size != it["size"] or int(st2.st_mtime) != it.get("mtime", int(st2.st_mtime)): put(("changed", ix))    # never blocks the transfer: the file is still sent and the completion summary warns about it
             put(("hash", ix, md.hexdigest()))
+            if cache is not None: cache.pop(it["id"], None)
         put(("end",))
     except BaseException as e: put(("err", e))
 
@@ -672,7 +730,7 @@ def _send_over(s, r, items, ctl, dest, host):
         if len(ctl.names) != len(all_items): ctl.set_files(["Text message" if it["t"] == "text" else it["rel"] for it in all_items], [it["size"] for it in all_items])   # first connection only: later ones keep the rows
         for ix, it in enumerate(items):
             if it["t"] == "file": ctl.fdone[omap[ix]] = it["size"] if it["id"] in dones else min(max(int(offs.get(it["id"], 0)), 0), it["size"])
-        q = queue.Queue(maxsize=8); th = threading.Thread(target=_producer, args=(items, offs, dones, q, stop, blk, rec), daemon=True); th.start()
+        q = queue.Queue(maxsize=8); th = threading.Thread(target=_producer, args=(items, offs, dones, q, stop, blk, rec, ctl.pfx), daemon=True); th.start()
         while True:
             m = q.get(); k = m[0]
             if k == "end": break
@@ -691,11 +749,20 @@ def _send_over(s, r, items, ctl, dest, host):
         s.settimeout(1800)       # the receiver may spend minutes moving / virus-scanning a big file before it says DONE: that is NOT a dead connection
         res = readline(r).decode("utf-8", "replace")
         while res.startswith("REPAIR "):      # the receiver found damaged blocks in some files and wants recovery data for those files only
-            byid = {it["id"]: (ix, it) for ix, it in enumerate(items) if it["t"] == "file"}; want = [i_ for i_ in json.loads(res[7:]).get("files", []) if i_ in byid]
+            req = json.loads(res[7:]); gm = req.get("groups") or {}
+            byid = {it["id"]: (ix, it) for ix, it in enumerate(items) if it["t"] == "file"}; want = [i_ for i_ in req.get("files", []) if i_ in byid]
             ctl.log(f"The receiver asked for recovery data for {len(want)} file(s) - sending it")
+            bm = req.get("blocks")
             for i_ in want:
                 ix, it = byid[i_]; ctl.repaired_ix.add(omap[ix])
-                for p_ in parity_blocks(it["abs"], it["size"]): s.sendall(p_); s.sendall(hashlib.sha256(p_).hexdigest().encode() + b"\n")
+                if bm is not None:      # just the damaged blocks, sent again
+                    with open(lp(it["abs"]), "rb") as f_:
+                        for bi_ in sorted({int(x) for x in bm.get(i_, []) if 0 <= int(x) < -(-it["size"] // CHK)}):
+                            f_.seek(bi_ * CHK); p_ = f_.read(min(CHK, it["size"] - bi_ * CHK))
+                            if len(p_) != min(CHK, it["size"] - bi_ * CHK): raise IOError("file changed while sending: " + it["rel"])
+                            s.sendall(p_); s.sendall(hashlib.sha256(p_).hexdigest().encode() + b"\n")
+                    continue
+                for p_ in parity_blocks(it["abs"], it["size"], rec or REC_GROUP, gm.get(i_)): s.sendall(p_); s.sendall(hashlib.sha256(p_).hexdigest().encode() + b"\n")
             res = readline(r).decode("utf-8", "replace")
         if res == "ERR paused": raise PeerPaused("paused")
         if res != "DONE": raise IOError(res or "no reply")
@@ -732,10 +799,11 @@ def _wait(ctl, secs):
 
 def _retry(ctl, attempt, deadline, e):
     now = time.monotonic()
-    if ctl.moved != ctl._seen: ctl._seen, attempt, deadline = ctl.moved, 0, None    # progress since the last failure -> fresh window
+    progressed = ctl.moved != ctl._seen
+    if progressed: ctl._seen, attempt, deadline = ctl.moved, 0, None    # progress since the last failure -> fresh window
     if deadline is None: deadline = now + ctl.cfg.get("reconnect_s", 300)
     if now > deadline: raise ConnectionLost(f"connection lost ({e})")
-    attempt += 1; delay = min(10, 1.5 ** attempt)
+    attempt += 1; delay = .25 if progressed and attempt == 1 else min(10, 1.5 ** attempt)      # the link was working a moment ago (a block arrived damaged, a hiccup): try again at once, back off only if that fails
     ctl.set_state("reconnecting", f"Connection lost - reconnecting in {int(delay) + 1}s"); _wait(ctl, delay)
     return attempt, deadline
 
@@ -750,6 +818,11 @@ def _dedupe(items):
 
 
 def send(host, port, items, ctl, dest=""):
+    try: return _send_loop(host, port, items, ctl, dest)
+    finally: ctl.pfx.clear()
+
+
+def _send_loop(host, port, items, ctl, dest=""):
     """Sends everything; reconnects and resumes on its own for up to cfg['reconnect_s'] seconds. Raises Paused / ConnectionLost (resumable)."""
     attempt, deadline = 0, None; items = _dedupe(items)
     while True:

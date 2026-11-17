@@ -133,3 +133,21 @@ network could read them. Use your own hotspot or a network you trust. Every file
 
 ## r12: option to disable automatic file skipping
 - Settings -> "Skip a file that keeps failing" (config key `skip_failed`, default on). On: a file that keeps arriving damaged (5 repairs at one spot / 40 in total), fails its checksum 3 times, or loses step twice is skipped and the rest of the transfer continues (it is listed as failed in the summary). Off: the PC never gives up on a file by itself - it keeps fetching it again until it arrives right. While a file keeps failing the sender shows "reconnecting" and the retry time limit restarts whenever data moves, so it can go on until you press Cancel; the manual per-file skip button always works.
+
+## r13: faster, smoother repair
+- **Fewer retries:** recovery data now covers one damaged block per 8 blocks (32 MiB) instead of per 32 (128 MiB). The receiver announces the group size in `rep`, so existing senders (including the old APK) follow it. It is still sent only for files that arrived damaged (12.5% of those files). "Repair files up to" now defaults to 32 GB (was 1 GB, so big videos retried one block at a time); an untouched old default of 1.0 is upgraded automatically.
+- **Cheaper retries:** a sender that reconnects after progress waits 0.25 s instead of 1.5 s; the PC no longer re-reads the whole partial file it just cut back itself (size and modified time must be unchanged; the final whole-file checks still run); the sender keeps the checksum of the already-sent part for 5 minutes instead of re-reading it on every retry. Both the Windows sender (`hotshare_core.py`) and the Android sender (`Core.kt`) got this.
+- Build tag `r13-fastrepair`. Rebuild the APK to get the Android half; the Windows half works with the old APK too.
+
+## r14: damaged blocks are simply sent again
+- New capability `repb`: when the sender has it (this Windows build and the new APK), a damaged block never forces a reconnect. The receiver keeps going, then asks for just the damaged blocks (one 4 MiB block each, checksummed), puts them in place and verifies the whole file. A block that arrives damaged again is asked for again (up to 4 rounds). No size limit, no group limit.
+- Senders with only `repg` send recovery data for just the groups that contain damage (groups of 4 blocks); senders with only `rep` (older APKs) behave as in r13.
+- Loopback test with a corrupted byte about every 12 MB of a 200 MB file: original 29-50 s and 15-26 reconnects, r13 6-10 s, r14 1.3 s and no reconnects.
+
+## r15
+- The resend of damaged blocks keeps going for as long as it makes progress (it gives up only after 3 rounds with no progress), so noisy links converge instead of falling back to reconnecting. Test: 60 MB of 29 mixed files with a corrupted byte every 2 MB (1400 corrupted chunks) arrives intact in 9 s.
+
+## r16 (bug fixes)
+- The one-time upgrade of the old 1 GB "Repair files up to" default never ran (the new default hid the missing version number). Fixed: an old untouched 1.0 now becomes 32; a value you chose yourself is kept.
+- A connection that dropped in the middle of a file that already had a damaged block made the sender think the file had changed, so the whole file started over. It now resumes from the first damaged block.
+- Resent blocks are written to disk as they arrive instead of being kept in memory (a heavily damaged multi-GB file could have used gigabytes of RAM).
